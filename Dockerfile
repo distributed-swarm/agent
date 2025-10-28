@@ -5,6 +5,9 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Add curl for internal checks and controller comms
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 # Create an unprivileged user
 RUN useradd -u 10001 -ms /bin/bash appuser
 
@@ -21,6 +24,10 @@ USER appuser
 # If you later have requirements.txt, uncomment these:
 # COPY --chown=appuser:appuser requirements.txt /app/
 # RUN pip install --no-cache-dir -r requirements.txt
+
+# Lightweight healthcheck: confirm controller is reachable from this agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://controller:8080/healthz || exit 1
 
 # Stub command so the container proves it's alive
 # Replace this with your real entrypoint when ready

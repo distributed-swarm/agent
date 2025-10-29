@@ -31,4 +31,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 
 # Stub command so the container proves it's alive
 # Replace this with your real entrypoint when ready
-CMD ["python", "/app/app.py"]
+CMD ["python", "app.py"]

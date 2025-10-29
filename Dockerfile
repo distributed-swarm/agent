@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 # Create an unprivileged user
-RUN useradd -u 10001 -ms /bin/bash appuser
+RUN adduser --disabled-password --gecos '' appuser
 
 # OCI labels help traceability in GHCR
 LABEL org.opencontainers.image.title="distributed-swarm Agent" \
@@ -31,4 +31,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 
 # Stub command so the container proves it's alive
 # Replace this with your real entrypoint when ready
-CMD ["python","-c","print('agent stub up', flush=True); import time; time.sleep(10**9)"]
+CMD ["python", "/app/app.py"]

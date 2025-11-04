@@ -1,45 +1,68 @@
-# app.py — heartbeat + simple task worker
-import os, time, socket, requests, hashlib
-import time, random
+# app.py — heartbeat + simple task worker (stable long-poll + backoff)
+import os, time, socket, random, signal, json
+import requests
+from typing import Optional
 
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080")
 AGENT_NAME     = os.getenv("AGENT_NAME", socket.gethostname())
-SLEEP_SECONDS  = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
-TASK_INTERVAL  = int(os.getenv("TASK_INTERVAL", "0"))
+HEARTBEAT_SEC  = int(os.getenv("HEARTBEAT_INTERVAL", "30"))   # heartbeat cadence
+TASK_INTERVAL  = int(os.getenv("TASK_INTERVAL", "0"))         # sleep after each task (ms allowed via env too)
+WAIT_MS        = int(os.getenv("TASK_WAIT_MS", "2000"))       # server long-poll wait
+TIMEOUT_SEC    = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))    # request timeout
 
-def post_heartbeat():
-    url = f"{CONTROLLER_URL}/healthz"
+# graceful shutdown
+_running = True
+def _stop(*_):
+    global _running
+    _running = False
+signal.signal(signal.SIGINT, _stop)
+signal.signal(signal.SIGTERM, _stop)
+
+# single Session keeps TCP alive and reduces overhead
+session = requests.Session()
+session.headers.update({"X-Agent": AGENT_NAME})
+
+def log(msg):
+    print(f"[agent:{AGENT_NAME}] {msg}", flush=True)
+
+def heartbeat():
     try:
-        r = requests.get(url, timeout=5)
-        print(f"[heartbeat] {AGENT_NAME} -> {url}  status={r.status_code}")
+        r = session.get(f"{CONTROLLER_URL}/healthz", timeout=TIMEOUT_SEC)
+        log(f"heartbeat -> {r.status_code}")
     except Exception as e:
-        print(f"[heartbeat] failed: {e}")
+        log(f"heartbeat failed: {e}")
 
-def do_task():
-    turl = f"{CONTROLLER_URL}/task"
+def fetch_task() -> Optional[dict]:
     try:
-        # long-poll: controller will wait up to ~2s before returning 204
-        r = requests.get(turl, params={"agent": AGENT_NAME}, timeout=5)
+        r = session.get(
+            f"{CONTROLLER_URL}/task",
+            params={"agent": AGENT_NAME, "wait_ms": WAIT_MS},
+            timeout=TIMEOUT_SEC,
+        )
+        if r.status_code == 204:
+            return None
+        if r.status_code != 200:
+            log(f"task fetch unexpected {r.status_code}")
+            return None
+        return r.json()
     except Exception as e:
-        print(f"[task] fetch error: {e}")
-        return
+        log(f"task fetch error: {e}")
+        return None
 
-    if r.status_code == 204:
-        # no work right now; tiny jitter so multiple agents don't all re-ask at once
-        time.sleep(random.uniform(0.01, 0.05))
-        return
+def run_task(task: dict) -> dict:
+    tid = task.get("id", "tsk-unknown")
+    op  = task.get("op")
+    payload = task.get("payload", "")
 
-    if r.status_code != 200:
-        print(f"[task] unexpected {r.status_code}")
-        return
-
-    task = r.json()
-    op   = task.get("op")
-    payload = task.get("payload")
-    tid  = task.get("id", "tsk-unknown")
+    # normalize payload to str for hashing
+    if not isinstance(payload, str):
+        try:
+            payload = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            payload = str(payload)
 
     start = time.time()
-    ok, output = False, None
+    ok, output, err = False, None, None
 
     try:
         if op == "sha256":
@@ -47,24 +70,58 @@ def do_task():
             output = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             ok = True
         else:
-            output = f"unsupported op: {op}"
-            ok = False
+            err = f"unsupported op: {op}"
     except Exception as e:
-        output = f"error: {e}"
-        ok = False
+        err = f"{type(e).__name__}: {e}"
 
     duration_ms = int((time.time() - start) * 1000)
 
+    res = {
+        "id": tid,
+        "agent": AGENT_NAME,
+        "ok": ok,
+        "output": output if ok else None,
+        "duration_ms": duration_ms,
+        "error": None if ok else err,
+    }
+    return res
+
+def post_result(res: dict):
     try:
-        res = {
-            "id": tid,
-            "agent": AGENT_NAME,
-            "ok": ok,
-            "output": output,
-            "duration_ms": duration_ms,
-            "error": None if ok else output,
-        }
-        requests.post(f"{CONTROLLER_URL}/result", json=res, timeout=5)
-        print(f"[task] result -> {res.get('ok')}  ms={duration_ms}")
+        session.post(f"{CONTROLLER_URL}/result", json=res, timeout=TIMEOUT_SEC)
+        log(f"result -> ok={res['ok']} ms={res['duration_ms']}")
     except Exception as e:
-        print(f"[task] post error: {e}")
+        log(f"result post error: {e}")
+
+def main():
+    log("starting")
+    last_hb = 0.0
+    backoff = 0.25  # seconds, grows on errors, shrinks on success
+
+    while _running:
+        now = time.time()
+        if now - last_hb >= HEARTBEAT_SEC:
+            heartbeat()
+            last_hb = now
+
+        task = fetch_task()
+        if task is None:
+            # no work, small jitter to avoid stampedes
+            time.sleep(random.uniform(0.02, 0.06))
+            continue
+
+        res = run_task(task)
+        post_result(res)
+
+        # gentle pacing after each task
+        if TASK_INTERVAL > 0:
+            time.sleep(TASK_INTERVAL / 1000.0)
+
+        # success path reduces backoff
+        backoff = max(0.1, backoff * 0.5)
+
+    log("stopping")
+
+if __name__ == "__main__":
+    main()
+

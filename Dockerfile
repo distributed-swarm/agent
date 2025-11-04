@@ -1,30 +1,34 @@
 # Minimal base
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    CONTROLLER_URL=http://controller:8080
 
-# tools we use in healthcheck
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# tools for healthcheck; keep it small
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# non-root user
-RUN useradd -u 10001 -ms /bin/bash appuser
-
-# Workdir
+# workdir
 WORKDIR /app
-RUN chown -R appuser:appuser /app
+
+# deps first for layer cache
+COPY requirements.txt /app/requirements.txt
+RUN if [ -s requirements.txt ]; then \
+      pip install --no-cache-dir --upgrade pip && \
+      pip install --no-cache-dir -r requirements.txt ; \
+    fi
+
+# app code
+COPY app.py /app/app.py
+
+# non-root user after deps are installed
+RUN useradd -u 10001 -ms /bin/bash appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Dependencies (optional but safe if we use requests)
-COPY --chown=appuser:appuser requirements.txt /app/requirements.txt
-RUN [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+# healthcheck respects CONTROLLER_URL (shell form so env is expanded)
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD sh -c 'curl -fsS "$CONTROLLER_URL/healthz" || exit 1'
 
-# Your code
-COPY --chown=appuser:appuser app.py /app/app.py
-
-# Healthcheck: confirm controller reachable
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -fsS http://controller:8080/healthz || exit 1
-
-# Run the agent
+# run
 CMD ["python", "/app/app.py"]
-

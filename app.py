@@ -1,4 +1,5 @@
-# app.py — heartbeat + simple task worker (stable long-poll + backoff)
+# app.py — heartbeat + simple task worker (sha256 + map_tokenize)
+
 import os, time, socket, random, signal, json
 import requests
 from typing import Optional
@@ -6,7 +7,7 @@ from typing import Optional
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080")
 AGENT_NAME     = os.getenv("AGENT_NAME", socket.gethostname())
 HEARTBEAT_SEC  = int(os.getenv("HEARTBEAT_INTERVAL", "30"))   # heartbeat cadence
-TASK_INTERVAL  = int(os.getenv("TASK_INTERVAL", "0"))         # sleep after each task (ms allowed via env too)
+TASK_INTERVAL  = int(os.getenv("TASK_INTERVAL", "0"))         # sleep after each task (ms)
 WAIT_MS        = int(os.getenv("TASK_WAIT_MS", "2000"))       # server long-poll wait
 TIMEOUT_SEC    = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))    # request timeout
 
@@ -49,26 +50,71 @@ def fetch_task() -> Optional[dict]:
         log(f"task fetch error: {e}")
         return None
 
+# ------------------ operation handlers ------------------
+
+def handle_sha256(payload: str) -> dict:
+    import hashlib
+    return {"ok": True, "output": hashlib.sha256(payload.encode("utf-8")).hexdigest()}
+
+def handle_map_tokenize(task: dict) -> dict:
+    """
+    Expect task payload like:
+      {"source": {"file": "C:/path/to/demo.jsonl"}}
+    Each JSONL line should contain a {"text": "..."} field.
+    """
+    try:
+        src = (((task.get("payload") or {}).get("source") or {}).get("file"))
+        if not src:
+            return {"ok": False, "error": "missing payload.source.file"}
+
+        records = 0
+        total_tokens = 0
+
+        with open(src, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                txt = str(obj.get("text", ""))
+                # simple whitespace tokenization
+                total_tokens += len(txt.split())
+                records += 1
+
+        avg_tokens = (total_tokens / records) if records else 0.0
+        return {"ok": True, "output": {
+            "records": records,
+            "total_tokens": total_tokens,
+            "avg_tokens": avg_tokens
+        }}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+# ------------------ task runner ------------------
+
 def run_task(task: dict) -> dict:
     tid = task.get("id", "tsk-unknown")
     op  = task.get("op")
     payload = task.get("payload", "")
 
-    # normalize payload to str for hashing
-    if not isinstance(payload, str):
+    # normalize payload to str for hashing path only
+    payload_str = payload
+    if not isinstance(payload_str, str):
         try:
-            payload = json.dumps(payload, ensure_ascii=False)
+            payload_str = json.dumps(payload, ensure_ascii=False)
         except Exception:
-            payload = str(payload)
+            payload_str = str(payload)
 
     start = time.time()
     ok, output, err = False, None, None
 
     try:
         if op == "sha256":
-            import hashlib
-            output = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-            ok = True
+            r = handle_sha256(payload_str)
+            ok, output, err = r.get("ok", False), r.get("output"), r.get("error")
+        elif op == "map_tokenize":
+            r = handle_map_tokenize(task)
+            ok, output, err = r.get("ok", False), r.get("output"), r.get("error")
         else:
             err = f"unsupported op: {op}"
     except Exception as e:
@@ -124,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

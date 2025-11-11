@@ -25,6 +25,7 @@ signal.signal(signal.SIGTERM, _stop)
 
 session = requests.Session()
 session.headers.update({"X-Agent": AGENT_NAME})
+session.headers.update({"X-Tasks": os.getenv("TASKS", "")})
 
 def log(msg: str) -> None:
     print(f"[agent:{AGENT_NAME}] {msg}", flush=True)

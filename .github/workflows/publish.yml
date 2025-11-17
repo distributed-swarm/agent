@@ -8,7 +8,7 @@ on:
       - app.py
       - worker_sizing.py
       - requirements.txt
-      - .github/workflows/publish-agent.yml
+      - .github/workflows/publish.yml
   workflow_dispatch:
 
 permissions:

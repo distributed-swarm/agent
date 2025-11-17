@@ -6,21 +6,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CONTROLLER_URL=http://controller:8080
 
 # tools for healthcheck; keep it small
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
 # workdir
 WORKDIR /app
 
 # deps first for layer cache
-COPY requirements.txt /app/requirements.txt
+COPY requirements.txt ./requirements.txt
 RUN if [ -s requirements.txt ]; then \
       pip install --no-cache-dir --upgrade pip && \
       pip install --no-cache-dir -r requirements.txt ; \
     fi
 
-# app code
-COPY app.py /app/app.py
+# app code – IMPORTANT: include worker_sizing.py
+COPY app.py worker_sizing.py ./
 
 # non-root user after deps are installed
 RUN useradd -u 10001 -ms /bin/bash appuser && chown -R appuser:appuser /app

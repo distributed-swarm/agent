@@ -1,8 +1,10 @@
-# app.py — heartbeat + simple task worker (sha256 + map_tokenize) + GPU/labels advertise
+# app.py — heartbeat + simple task worker (sha256 + map_tokenize) + GPU/labels/worker advertise
 
 import os, time, socket, random, signal, json, hashlib, shutil, subprocess
 from typing import Optional, List, Dict, Any, Tuple
 import requests
+
+from worker_sizing import build_worker_profile  # NEW: worker sizing for CPU/GPU
 
 # ------------------ config ------------------
 
@@ -184,6 +186,9 @@ _last_caps: Optional[Dict[str, Any]] = None
 _last_caps_ts: float = 0.0
 
 def _collect_capabilities(force: bool = False) -> Dict[str, Any]:
+    """
+    Collect hardware + labels + worker sizing into one capabilities snapshot.
+    """
     global _last_caps, _last_caps_ts
     now = time.time()
     if not force and _last_caps and (now - _last_caps_ts) < max(10, HEARTBEAT_SEC):
@@ -195,13 +200,26 @@ def _collect_capabilities(force: bool = False) -> Dict[str, Any]:
     if gpu_caps is None:
         gpu_caps = {"present": False}
 
+    cpu_mem = _cpu_mem_caps()
+    total_cores = os.cpu_count() or 1
+    vram_mb = gpu_caps.get("vram_mb")
+    vram_gb = int(vram_mb / 1024) if isinstance(vram_mb, int) and vram_mb > 0 else None
+
+    worker_profile = build_worker_profile(
+        total_cores=total_cores,
+        gpu_present=bool(gpu_caps.get("present")),
+        gpu_count=int(gpu_caps.get("count") or 0),
+        vram_gb=vram_gb,
+    )
+
     caps: Dict[str, Any] = {
         "gpu": gpu_caps,
-        **_cpu_mem_caps(),
+        **cpu_mem,
         "labels": _LABELS,
         "agent_name": AGENT_NAME,
         "hostname": socket.gethostname(),
         "api_version": "v1",
+        "workers": worker_profile,
     }
     _last_caps, _last_caps_ts = caps, now
     return caps
@@ -225,6 +243,7 @@ def heartbeat():
             "gpu": caps.get("gpu", {}),
             "cpu": caps.get("cpu", {}),
             "memory": caps.get("memory", {}),
+            "workers": caps.get("workers", {}),
         },
         "timestamp": int(time.time()),
     }

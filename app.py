@@ -247,20 +247,20 @@ def heartbeat():
         },
         "timestamp": int(time.time()),
     }
-    # Try /agents/heartbeat, fall back to /agents/register on first run
+    # Try /api/agents/heartbeat, fall back to /api/agents/register on first run
     try:
-        session.post(f"{CONTROLLER_URL}/agents/heartbeat", json=payload, timeout=TIMEOUT_SEC)
+        session.post(f"{CONTROLLER_URL}/api/agents/heartbeat", json=payload, timeout=TIMEOUT_SEC)
     except Exception:
         # one-time soft register; ignore failure
         try:
-            session.post(f"{CONTROLLER_URL}/agents/register", json=payload, timeout=TIMEOUT_SEC)
+            session.post(f"{CONTROLLER_URL}/api/agents/register", json=payload, timeout=TIMEOUT_SEC)
         except Exception:
             pass
 
 def fetch_task() -> Optional[dict]:
     try:
         r = session.get(
-            f"{CONTROLLER_URL}/task",
+            f"{CONTROLLER_URL}/api/task",
             params={"agent": AGENT_NAME, "wait_ms": WAIT_MS},
             timeout=TIMEOUT_SEC,
         )
@@ -276,7 +276,7 @@ def fetch_task() -> Optional[dict]:
 
 def post_result(res: dict):
     try:
-        session.post(f"{CONTROLLER_URL}/result", json=res, timeout=TIMEOUT_SEC)
+        session.post(f"{CONTROLLER_URL}/api/result", json=res, timeout=TIMEOUT_SEC)
         log(f"result -> ok={res['ok']} ms={res['duration_ms']}")
     except Exception as e:
         log(f"result post error: {e}")
@@ -472,7 +472,7 @@ def main():
     # send an initial capabilities register (best-effort)
     try:
         session.post(
-            f"{CONTROLLER_URL}/agents/register",
+            f"{CONTROLLER_URL}/api/agents/register",
             json={
                 "agent": AGENT_NAME,
                 "labels": _LABELS,

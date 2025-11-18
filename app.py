@@ -468,7 +468,8 @@ def run_task(task: dict) -> dict:
 # ------------------ main loop ------------------
 
 def main():
-    log("starting")
+    # extra startup log for debugging controller wiring
+    log(f"starting with CONTROLLER_URL={CONTROLLER_URL}")
     # send an initial capabilities register (best-effort)
     try:
         session.post(

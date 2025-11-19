@@ -4,7 +4,7 @@ import os, time, socket, random, signal, json, hashlib, shutil, subprocess
 from typing import Optional, List, Dict, Any, Tuple
 import requests
 
-from worker_sizing import build_worker_profile  # NEW: worker sizing for CPU/GPU
+from worker_sizing import build_worker_profile  # worker sizing for CPU/GPU
 
 # ------------------ config ------------------
 
@@ -96,7 +96,7 @@ def _run(cmd: List[str]) -> Tuple[int, str, str]:
 def _probe_gpu_with_nvidia_smi() -> Optional[Dict[str, Any]]:
     if not shutil.which("nvidia-smi"):
         return None
-    # Query first GPU line; if multiple, we summarize basics and aggregate VRAM
+    # Query GPUs; summarize basics and aggregate VRAM
     fmt = "--query-gpu=name,driver_version,memory.total,compute_cap,utilization.gpu --format=csv,noheader,nounits"
     code, out, err = _run(["nvidia-smi", fmt])
     if code != 0 or not out:

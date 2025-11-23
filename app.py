@@ -1,30 +1,22 @@
-# app.py - agent worker: heartbeat + task loop (map_tokenize, map_classify with HF)
-
 import os
 import time
 import socket
-import random
 import signal
-import json
-import hashlib
-import shutil
-import subprocess
 import threading
 from typing import Optional, List, Dict, Any
 
 import requests
-import torch  # make sure torch is explicitly imported in this module
-
-from worker_sizing import build_worker_profile  # worker sizing for CPU/GPU
+import torch
+from worker_sizing import build_worker_profile
 
 # ---------------- config ----------------
 
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080")
 AGENT_NAME = os.getenv("AGENT_NAME", socket.gethostname())
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
-TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))  # ms to sleep after each task poll
-HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))  # request timeout
-AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")  # e.g. "lab-basement,host=dl-rig-1"
+TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))
+AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
 
 _running = True
 
@@ -41,9 +33,6 @@ signal.signal(signal.SIGTERM, _stop)
 
 
 def _parse_labels(raw: str) -> Dict[str, Any]:
-    """
-    Turn "a,b,c=1" into {"tags":["a","b"],"c":"1"} without being precious about it.
-    """
     labels: Dict[str, Any] = {}
     tags: List[str] = []
 
@@ -86,15 +75,11 @@ def _url(path: str) -> str:
 
 
 def _post(path: str, payload: Dict[str, Any]) -> requests.Response:
-    return requests.post(
-        _url(path), json=payload, timeout=HTTP_TIMEOUT_SEC
-    )
+    return requests.post(_url(path), json=payload, timeout=HTTP_TIMEOUT_SEC)
 
 
 def _get(path: str, params: Dict[str, Any]) -> requests.Response:
-    return requests.get(
-        _url(path), params=params, timeout=HTTP_TIMEOUT_SEC
-    )
+    return requests.get(_url(path), params=params, timeout=HTTP_TIMEOUT_SEC)
 
 
 # ---------------- registration / heartbeat ----------------
@@ -134,39 +119,27 @@ def heartbeat_loop() -> None:
         time.sleep(HEARTBEAT_SEC)
 
 
-# ---------------- HuggingFace sentiment (lazy init) ----------------
+# ---------------- HF sentiment (lazy init) ----------------
 
 _SENTIMENT_LOCK = threading.Lock()
 _SENTIMENT_PIPELINE = None
 
 
 def get_sentiment_pipeline():
-    """
-    Lazily create the HF sentiment pipeline once per process.
-
-    Uses assemblyai/distilbert-base-uncased-sst2 for sentiment.
-    """
     global _SENTIMENT_PIPELINE
     if _SENTIMENT_PIPELINE is not None:
         return _SENTIMENT_PIPELINE
 
-    from transformers import pipeline  # import here so we see any issues cleanly
+    from transformers import pipeline
 
     with _SENTIMENT_LOCK:
         if _SENTIMENT_PIPELINE is None:
-            print(f"[agent] loading sentiment pipeline (torch={torch.__version__})...")
-            try:
-                _SENTIMENT_PIPELINE = pipeline(
-                    "sentiment-analysis",
-                    model="assemblyai/distilbert-base-uncased-sst2",
-                )
-                print("[agent] sentiment pipeline loaded")
-            except Exception as e:
-                import traceback
-
-                print("[agent] ERROR loading sentiment pipeline:")
-                traceback.print_exc()
-                raise
+            print(f"[agent {AGENT_NAME}] loading sentiment pipeline (torch={torch.__version__})...")
+            _SENTIMENT_PIPELINE = pipeline(
+                "sentiment-analysis",
+                model="assemblyai/distilbert-base-uncased-sst2",
+            )
+            print(f"[agent {AGENT_NAME}] sentiment pipeline loaded")
     return _SENTIMENT_PIPELINE
 
 
@@ -176,11 +149,7 @@ def get_sentiment_pipeline():
 def handle_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = str(payload.get("text", ""))
     tokens = text.split()
-    return {
-        "text": text,
-        "token_count": len(tokens),
-        "tokens": tokens,
-    }
+    return {"text": text, "token_count": len(tokens), "tokens": tokens}
 
 
 def handle_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -190,10 +159,7 @@ def handle_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = get_sentiment_pipeline()
     out = pipe(text)
-    return {
-        "text": text,
-        "sentiment": out,
-    }
+    return {"text": text, "sentiment": out}
 
 
 # ---------------- result posting ----------------
@@ -219,9 +185,7 @@ def post_result(
     try:
         resp = _post("/result", body)
         if not resp.ok:
-            print(
-                f"[agent {AGENT_NAME}] result post HTTP {resp.status_code}: {resp.text}"
-            )
+            print(f"[agent {AGENT_NAME}] result post HTTP {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"[agent {AGENT_NAME}] result post error: {e}")
 
@@ -230,25 +194,21 @@ def post_result(
 
 
 def task_loop() -> None:
+    import traceback
+
     while _running:
         try:
-            resp = _get(
-                "/task",
-                {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS},
-            )
+            resp = _get("/task", {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS})
         except Exception as e:
             print(f"[agent {AGENT_NAME}] task poll error: {e}")
             time.sleep(3.0)
             continue
 
         if resp.status_code == 204:
-            # no work
             continue
 
         if not resp.ok:
-            print(
-                f"[agent {AGENT_NAME}] task poll HTTP {resp.status_code}: {resp.text}"
-            )
+            print(f"[agent {AGENT_NAME}] task poll HTTP {resp.status_code}: {resp.text}")
             time.sleep(1.0)
             continue
 
@@ -282,8 +242,6 @@ def task_loop() -> None:
                 ok = False
                 error = f"unknown op: {op}"
         except Exception as e:
-            import traceback
-
             print(f"[agent {AGENT_NAME}] ERROR while handling job {job_id} ({op}):")
             traceback.print_exc()
             ok = False

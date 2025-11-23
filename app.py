@@ -13,6 +13,7 @@ import threading
 from typing import Optional, List, Dict, Any
 
 import requests
+import torch  # make sure torch is explicitly imported in this module
 
 from worker_sizing import build_worker_profile  # worker sizing for CPU/GPU
 
@@ -149,16 +150,23 @@ def get_sentiment_pipeline():
     if _SENTIMENT_PIPELINE is not None:
         return _SENTIMENT_PIPELINE
 
+    from transformers import pipeline  # import here so we see any issues cleanly
+
     with _SENTIMENT_LOCK:
         if _SENTIMENT_PIPELINE is None:
-            from transformers import pipeline
+            print(f"[agent] loading sentiment pipeline (torch={torch.__version__})...")
+            try:
+                _SENTIMENT_PIPELINE = pipeline(
+                    "sentiment-analysis",
+                    model="assemblyai/distilbert-base-uncased-sst2",
+                )
+                print("[agent] sentiment pipeline loaded")
+            except Exception as e:
+                import traceback
 
-            print("[agent] loading sentiment pipeline...")
-            _SENTIMENT_PIPELINE = pipeline(
-                "sentiment-analysis",
-                model="assemblyai/distilbert-base-uncased-sst2",
-            )
-            print("[agent] sentiment pipeline loaded")
+                print("[agent] ERROR loading sentiment pipeline:")
+                traceback.print_exc()
+                raise
     return _SENTIMENT_PIPELINE
 
 
@@ -274,6 +282,10 @@ def task_loop() -> None:
                 ok = False
                 error = f"unknown op: {op}"
         except Exception as e:
+            import traceback
+
+            print(f"[agent {AGENT_NAME}] ERROR while handling job {job_id} ({op}):")
+            traceback.print_exc()
             ok = False
             error = f"{type(e).__name__}: {e}"
 
@@ -289,6 +301,7 @@ def main() -> None:
         f"[agent {AGENT_NAME}] starting. controller={CONTROLLER_URL}, "
         f"labels={BASE_LABELS}, capabilities={CAPABILITIES}"
     )
+    print(f"[agent {AGENT_NAME}] torch version: {torch.__version__}")
     register_once()
 
     hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)

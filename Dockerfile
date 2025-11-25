@@ -1,35 +1,39 @@
-# Minimal base
+# Agent image for Neuro Fabric / distributed-swarm
+
 FROM python:3.11-slim-bookworm
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    CONTROLLER_URL=http://controller:8080
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
 
-# tools for healthcheck; keep it small
+# Basic OS deps (curl so you can debug, plus build tools if pip ever needs them)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
- && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends \
+       curl \
+       ca-certificates \
+       build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# workdir
+# Work in /app
 WORKDIR /app
 
-# deps first for layer cache
+# Copy requirements and install Python deps
 COPY requirements.txt ./requirements.txt
+
 RUN if [ -s requirements.txt ]; then \
-      pip install --no-cache-dir --upgrade pip && \
-      pip install --no-cache-dir -r requirements.txt ; \
+        pip install --no-cache-dir -r requirements.txt; \
     fi
 
-# app code – IMPORTANT: include worker_sizing.py
+# Copy application code
 COPY app.py worker_sizing.py ./
 
-# non-root user after deps are installed
-RUN useradd -u 10001 -ms /bin/bash appuser && chown -R appuser:appuser /app
+# Make "python" and "python3" behave the same inside the container
+RUN ln -s /usr/local/bin/python3 /usr/local/bin/python || true
+
+# Create non-root user
+RUN useradd -u 10001 -ms /bin/bash appuser \
+    && chown -R appuser:appuser /app
+
 USER appuser
 
-# healthcheck respects CONTROLLER_URL (shell form so env is expanded)
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD sh -c 'curl -fsS "$CONTROLLER_URL/healthz" || exit 1'
-
-# run
+# Default command: run the agent
 CMD ["python", "/app/app.py"]

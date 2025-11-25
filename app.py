@@ -51,14 +51,72 @@ def _parse_labels(raw: str) -> Dict[str, Any]:
     return labels
 
 
-try:
-    WORKER_PROFILE = build_worker_profile()
-except Exception as e:
-    WORKER_PROFILE = {"error": f"{type(e).__name__}: {e}"}
+def _enrich_worker_profile_with_torch_cuda(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Force GPU detection using torch.cuda inside the container, even if worker_sizing
+    didn't manage to detect it (e.g., nvidia-smi missing in image).
+    """
+    if not isinstance(profile, dict):
+        profile = {}
 
+    gpu_section: Dict[str, Any] = profile.get("gpu", {}) or {}
+
+    try:
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            gpu_names: List[str] = []
+            vram_list_gb: List[float] = []
+
+            for idx in range(gpu_count):
+                props = torch.cuda.get_device_properties(idx)
+                gpu_names.append(props.name)
+                # props.total_memory is bytes
+                vram_list_gb.append(props.total_memory / (1024 ** 3))
+
+            if gpu_count > 0:
+                gpu_section.update(
+                    {
+                        "gpu_present": True,
+                        "gpu_count": gpu_count,
+                        "vram_gb": round(max(vram_list_gb), 2),
+                        "gpu_names": gpu_names,
+                    }
+                )
+        else:
+            # torch sees no CUDA device
+            gpu_section.setdefault("gpu_present", False)
+            gpu_section.setdefault("gpu_count", 0)
+            gpu_section.setdefault("vram_gb", None)
+    except Exception as e:
+        # Don't crash the agent if CUDA inspection blows up
+        gpu_section["torch_cuda_error"] = f"{type(e).__name__}: {e}"
+
+    profile["gpu"] = gpu_section
+    return profile
+
+
+try:
+    _raw_profile = build_worker_profile()
+except Exception as e:
+    _raw_profile = {"error": f"{type(e).__name__}: {e}"}
+
+WORKER_PROFILE = _enrich_worker_profile_with_torch_cuda(_raw_profile)
+
+# Base labels include worker_profile plus flattened GPU metrics for the controller
 BASE_LABELS: Dict[str, Any] = {
     "worker_profile": WORKER_PROFILE,
 }
+
+_gpu = WORKER_PROFILE.get("gpu", {}) if isinstance(WORKER_PROFILE, dict) else {}
+BASE_LABELS.update(
+    {
+        "gpu_present": _gpu.get("gpu_present"),
+        "gpu_count": _gpu.get("gpu_count"),
+        "gpu_vram_gb": _gpu.get("vram_gb"),
+        "gpu_names": _gpu.get("gpu_names"),
+    }
+)
+
 BASE_LABELS.update(_parse_labels(AGENT_LABELS_RAW))
 
 CAPABILITIES: Dict[str, Any] = {

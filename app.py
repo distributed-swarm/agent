@@ -7,7 +7,6 @@ from typing import Optional, List, Dict, Any
 
 import requests
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from worker_sizing import build_worker_profile
 
 # ---------------- config ----------------
@@ -18,14 +17,11 @@ HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
 TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))
 AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
-HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "assemblyai/distilbert-base-uncased-sst2")
 
 _running = True
 
-# ---------------- signal handling ----------------
 
-
-def _stop(*_args: Any) -> None:
+def _stop(*_args):
     global _running
     _running = False
 
@@ -33,262 +29,239 @@ def _stop(*_args: Any) -> None:
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
-# ---------------- GPU detection ----------------
+# ---------------- label helpers ----------------
+
+
+def _parse_labels(raw: str) -> Dict[str, Any]:
+    labels: Dict[str, Any] = {}
+    tags: List[str] = []
+
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            labels[k.strip()] = v.strip()
+        else:
+            tags.append(part)
+
+    if tags:
+        labels["tags"] = tags
+    return labels
 
 
 def detect_gpu() -> Dict[str, Any]:
-    gpu_present = False
-    gpu_count = 0
-    vram_gb = 0.0
-    devices: List[Dict[str, Any]] = []
+    """
+    Detect GPUs using both /dev/nvidia* and torch.cuda.
+    Returns a dict shaped like:
 
+        {
+          "gpu_present": bool,
+          "gpu_count": int,
+          "vram_gb": float | None,
+          "devices": [
+             {"index": int, "name": str, "total_memory_bytes": int},
+             ...
+          ]
+        }
+    """
+    info: Dict[str, Any] = {
+        "gpu_present": False,
+        "gpu_count": 0,
+        "vram_gb": None,
+        "devices": [],
+    }
+
+    # 1) /dev/nvidia* count
+    try:
+        import glob
+
+        gpu_indices = []
+        for path in glob.glob("/dev/nvidia*"):
+            base = os.path.basename(path)
+            suffix = base.replace("nvidia", "", 1)
+            if suffix.isdigit():
+                gpu_indices.append(int(suffix))
+
+        if gpu_indices:
+            info["gpu_present"] = True
+            info["gpu_count"] = len(gpu_indices)
+    except Exception as e:
+        info["dev_nodes_error"] = f"{type(e).__name__}: {e}"
+
+    # 2) Torch CUDA details (if usable)
     try:
         if torch.cuda.is_available():
-            gpu_present = True
-            gpu_count = torch.cuda.device_count()
-            max_mem = 0
-            for idx in range(gpu_count):
+            device_count = torch.cuda.device_count()
+            devices: List[Dict[str, Any]] = []
+            vram_list_gb: List[float] = []
+
+            for idx in range(device_count):
                 props = torch.cuda.get_device_properties(idx)
-                mem_bytes = int(props.total_memory)
-                max_mem = max(max_mem, mem_bytes)
                 devices.append(
                     {
                         "index": idx,
                         "name": props.name,
-                        "total_memory_bytes": mem_bytes,
+                        "total_memory_bytes": int(props.total_memory),
                     }
                 )
-            if max_mem > 0:
-                vram_gb = round(max_mem / (1024 ** 3), 2)
-    except Exception as e:
-        print(f"[{AGENT_NAME}] GPU detection failed: {e}", flush=True)
+                vram_list_gb.append(props.total_memory / (1024 ** 3))
 
-    info: Dict[str, Any] = {
-        "gpu_present": gpu_present,
-        "gpu_count": gpu_count,
-        "vram_gb": vram_gb,
-        "devices": devices,
-    }
-    print(f"[{AGENT_NAME}] GPU info: {info}", flush=True)
+            if device_count > 0:
+                info["gpu_present"] = True
+                info["gpu_count"] = device_count
+                info["devices"] = devices
+                info["vram_gb"] = round(max(vram_list_gb), 2)
+    except Exception as e:
+        info["torch_cuda_error"] = f"{type(e).__name__}: {e}"
+
+    print(f"[{AGENT_NAME}] GPU info: {info}")
     return info
 
 
-# ---------------- labels & capabilities ----------------
+# Build worker profile and FORCE-IN our GPU info
+try:
+    base_profile = build_worker_profile()
+except Exception as e:
+    base_profile = {"error": f"{type(e).__name__}: {e}"}
 
-
-def _parse_labels(raw: str) -> Dict[str, str]:
-    """
-    Parse AGENT_LABELS like "role=gpu,zone=lab" into a dict.
-    """
-    labels: Dict[str, str] = {}
-    if not raw:
-        return labels
-    for part in raw.split(","):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        labels[k.strip()] = v.strip()
-    return labels
-
+if not isinstance(base_profile, dict):
+    base_profile = {}
 
 GPU_INFO = detect_gpu()
-WORKER_PROFILE = build_worker_profile()
+base_profile["gpu"] = GPU_INFO
 
-BASE_LABELS: Dict[str, Any] = _parse_labels(AGENT_LABELS_RAW)
-BASE_LABELS.update(
-    {
-        "gpu_present": str(GPU_INFO["gpu_present"]).lower(),
-        "gpu_count": str(GPU_INFO["gpu_count"]),
-        "vram_gb": str(GPU_INFO["vram_gb"]),
-    }
-)
+WORKER_PROFILE = base_profile
 
-BASE_CAPABILITIES: Dict[str, Any] = dict(WORKER_PROFILE)
-BASE_CAPABILITIES.update(
-    {
-        "gpu_present": GPU_INFO["gpu_present"],
-        "gpu_count": GPU_INFO["gpu_count"],
-        "vram_gb": GPU_INFO["vram_gb"],
-        "gpu_devices": GPU_INFO["devices"],
-    }
-)
+# Flatten GPU info for controller labels
+gpu_names: Optional[List[str]] = None
+if GPU_INFO.get("devices"):
+    gpu_names = [d.get("name") for d in GPU_INFO["devices"]]
 
-# Choose default device for ops
-_DEFAULT_DEVICE = "cuda" if GPU_INFO["gpu_present"] else "cpu"
-print(f"[{AGENT_NAME}] Using device: {_DEFAULT_DEVICE}", flush=True)
+BASE_LABELS: Dict[str, Any] = {
+    "worker_profile": WORKER_PROFILE,
+    "gpu_present": bool(GPU_INFO.get("gpu_present")),
+    "gpu_count": int(GPU_INFO.get("gpu_count") or 0),
+    "gpu_vram_gb": GPU_INFO.get("vram_gb"),
+    "gpu_names": gpu_names,
+}
 
-# ---------------- HF model (lazy init) ----------------
+BASE_LABELS.update(_parse_labels(AGENT_LABELS_RAW))
 
-_model_lock = threading.Lock()
-_model: Optional[AutoModelForSequenceClassification] = None
-_tokenizer: Optional[AutoTokenizer] = None
-_model_device: str = _DEFAULT_DEVICE
-
-
-def _init_model() -> None:
-    global _model, _tokenizer, _model_device
-    if _model is not None and _tokenizer is not None:
-        return
-    with _model_lock:
-        if _model is not None and _tokenizer is not None:
-            return
-        model_name = HF_MODEL_NAME
-        device = "cuda" if GPU_INFO["gpu_present"] and torch.cuda.is_available() else "cpu"
-        print(f"[{AGENT_NAME}] Loading HF model '{model_name}' on {device}", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        model.to(device)
-        model.eval()
-        _model = model
-        _tokenizer = tokenizer
-        _model_device = device
-
+CAPABILITIES: Dict[str, Any] = {
+    "ops": ["map_tokenize", "map_classify"],
+}
 
 # ---------------- HTTP helpers ----------------
 
 
-def _post_json(path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    url = f"{CONTROLLER_URL}{path}"
-    try:
-        resp = requests.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
-        if resp.status_code == 204:
-            return None
-        resp.raise_for_status()
-        if resp.content:
-            return resp.json()
-        return None
-    except Exception as e:
-        print(f"[{AGENT_NAME}] POST {url} failed: {e}", flush=True)
-        return None
+def _url(path: str) -> str:
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    return CONTROLLER_URL.rstrip("/") + path
 
 
-def _get_json(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    url = f"{CONTROLLER_URL}{path}"
-    try:
-        resp = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
-        if resp.status_code == 204:
-            return None
-        resp.raise_for_status()
-        if resp.content:
-            return resp.json()
-        return None
-    except Exception as e:
-        print(f"[{AGENT_NAME}] GET {url} failed: {e}", flush=True)
-        return None
+def _post(path: str, payload: Dict[str, Any]) -> requests.Response:
+    return requests.post(_url(path), json=payload, timeout=HTTP_TIMEOUT_SEC)
 
 
-# ---------------- ops ----------------
+def _get(path: str, params: Dict[str, Any]) -> requests.Response:
+    return requests.get(_url(path), params=params, timeout=HTTP_TIMEOUT_SEC)
 
 
-def op_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Simple CPU op kept for compatibility with existing jobs.
-    """
-    text = str(payload.get("text", ""))
-    tokens = text.split()
-    return {
-        "tokens": tokens,
-        "count": len(tokens),
-    }
+# ---------------- registration / heartbeat ----------------
 
 
-def op_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Sentiment classification via HF SST2 model.
-    """
-    _init_model()
-    assert _model is not None
-    assert _tokenizer is not None
-
-    text = str(payload.get("text", ""))
-    if not text:
-        return {"label": "NEUTRAL", "scores": []}
-
-    inputs = _tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=256,
-    )
-    inputs = {k: v.to(_model_device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = _model(**inputs)
-        logits = outputs.logits
-        probs = torch.softmax(logits, dim=-1)[0]
-
-    label_idx = int(torch.argmax(probs).item())
-    label = _model.config.id2label.get(label_idx, str(label_idx))
-    scores = probs.cpu().tolist()
-
-    return {
-        "label": label,
-        "scores": scores,
-        "device": _model_device,
-    }
-
-
-def execute_op(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if op == "map_classify":
-        return op_map_classify(payload)
-    if op == "map_tokenize":
-        return op_map_tokenize(payload)
-    # Unknown op: just echo payload
-    return {"op": op, "payload": payload}
-
-
-# ---------------- heartbeats ----------------
-
-
-def _heartbeat_loop() -> None:
-    """
-    Periodically tell the controller we're alive and refresh labels/capabilities.
-    """
-    while _running:
-        payload = {
-            "agent": AGENT_NAME,
-            "labels": BASE_LABELS,
-            "capabilities": BASE_CAPABILITIES,
-        }
-        _post_json("/agents/heartbeat", payload)
-        time.sleep(max(1, HEARTBEAT_SEC))
-
-
-# ---------------- task loop ----------------
-
-
-def _register_once() -> None:
-    payload = {
+def register_once() -> None:
+    body = {
         "agent": AGENT_NAME,
         "labels": BASE_LABELS,
-        "capabilities": BASE_CAPABILITIES,
+        "capabilities": CAPABILITIES,
     }
-    resp = _post_json("/agents/register", payload)
-    print(f"[{AGENT_NAME}] register response: {resp}", flush=True)
-
-
-def _run_task(job: Dict[str, Any]) -> None:
-    job_id = job.get("id")
-    op = job.get("op") or job.get("type") or "unknown"
-    payload = job.get("payload") or {}
-
-    start = time.time()
-    ok = True
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-
     try:
-        result = execute_op(op, payload)
+        resp = _post("/agents/register", body)
+        resp.raise_for_status()
+        print(f"[agent {AGENT_NAME}] registered -> {resp.json()}")
     except Exception as e:
-        ok = False
-        error = f"{type(e).__name__}: {e}"
-        print(f"[{AGENT_NAME}] Error running job {job_id}: {error}", flush=True)
+        print(f"[agent {AGENT_NAME}] register failed: {e}")
 
-    duration_ms = (time.time() - start) * 1000.0
 
-    result_payload = {
+def heartbeat_loop() -> None:
+    while _running:
+        body = {
+            "agent": AGENT_NAME,
+            "labels": BASE_LABELS,
+            "capabilities": CAPABILITIES,
+        }
+        try:
+            resp = _post("/agents/heartbeat", body)
+            if resp.ok:
+                data = resp.json()
+                ts = data.get("time")
+                print(f"[agent {AGENT_NAME}] heartbeat ok at {ts}")
+            else:
+                print(f"[agent {AGENT_NAME}] heartbeat HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[agent {AGENT_NAME}] heartbeat error: {e}")
+        time.sleep(HEARTBEAT_SEC)
+
+
+# ---------------- HF sentiment (lazy init) ----------------
+
+_SENTIMENT_LOCK = threading.Lock()
+_SENTIMENT_PIPELINE = None
+
+
+def get_sentiment_pipeline():
+    global _SENTIMENT_PIPELINE
+    if _SENTIMENT_PIPELINE is not None:
+        return _SENTIMENT_PIPELINE
+
+    from transformers import pipeline
+
+    with _SENTIMENT_LOCK:
+        if _SENTIMENT_PIPELINE is None:
+            print(f"[agent {AGENT_NAME}] loading sentiment pipeline (torch={torch.__version__})...")
+            _SENTIMENT_PIPELINE = pipeline(
+                "sentiment-analysis",
+                model="assemblyai/distilbert-base-uncased-sst2",
+            )
+            print(f"[agent {AGENT_NAME}] sentiment pipeline loaded")
+    return _SENTIMENT_PIPELINE
+
+
+# ---------------- op handlers ----------------
+
+
+def handle_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
+    text = str(payload.get("text", ""))
+    tokens = text.split()
+    return {"text": text, "token_count": len(tokens), "tokens": tokens}
+
+
+def handle_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
+    text = str(payload.get("text", ""))
+    if not text:
+        return {"text": text, "sentiment": [], "warning": "empty text"}
+
+    pipe = get_sentiment_pipeline()
+    out = pipe(text)
+    return {"text": text, "sentiment": out}
+
+
+# ---------------- result posting ----------------
+
+
+def post_result(
+    job_id: str,
+    op: str,
+    ok: bool,
+    result: Optional[Dict[str, Any]],
+    error: Optional[str],
+    duration_ms: float,
+) -> None:
+    body = {
         "id": job_id,
         "agent": AGENT_NAME,
         "ok": ok,
@@ -297,36 +270,91 @@ def _run_task(job: Dict[str, Any]) -> None:
         "op": op,
         "duration_ms": duration_ms,
     }
-    _post_json("/result", result_payload)
+    try:
+        resp = _post("/result", body)
+        if not resp.ok:
+            print(f"[agent {AGENT_NAME}] result post HTTP {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[agent {AGENT_NAME}] result post error: {e}")
 
 
-def _task_loop() -> None:
+# ---------------- task loop ----------------
+
+
+def task_loop() -> None:
+    import traceback
+
     while _running:
-        job = _get_json("/task", {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS})
-        if job is None:
-            # no task or error; small sleep to avoid tight loop on errors
-            time.sleep(0.2)
+        try:
+            resp = _get("/task", {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS})
+        except Exception as e:
+            print(f"[agent {AGENT_NAME}] task poll error: {e}")
+            time.sleep(3.0)
             continue
-        _run_task(job)
+
+        if resp.status_code == 204:
+            continue
+
+        if not resp.ok:
+            print(f"[agent {AGENT_NAME}] task poll HTTP {resp.status_code}: {resp.text}")
+            time.sleep(1.0)
+            continue
+
+        try:
+            job = resp.json()
+        except Exception as e:
+            print(f"[agent {AGENT_NAME}] bad JSON from controller: {e}")
+            time.sleep(1.0)
+            continue
+
+        job_id = job.get("id")
+        op = job.get("op")
+        payload = job.get("payload") or {}
+
+        if not job_id or not op:
+            print(f"[agent {AGENT_NAME}] malformed job: {job}")
+            time.sleep(1.0)
+            continue
+
+        start = time.time()
+        ok = True
+        result: Optional[Dict[str, Any]] = None
+        error: Optional[str] = None
+
+        try:
+            if op == "map_tokenize":
+                result = handle_map_tokenize(payload)
+            elif op == "map_classify":
+                result = handle_map_classify(payload)
+            else:
+                ok = False
+                error = f"unknown op: {op}"
+        except Exception as e:
+            print(f"[agent {AGENT_NAME}] ERROR while handling job {job_id} ({op}):")
+            traceback.print_exc()
+            ok = False
+            error = f"{type(e).__name__}: {e}"
+
+        duration_ms = (time.time() - start) * 1000.0
+        post_result(job_id, op, ok, result, error, duration_ms)
 
 
 # ---------------- main ----------------
 
 
 def main() -> None:
-    print(f"[{AGENT_NAME}] starting. controller={CONTROLLER_URL}", flush=True)
-    print(f"[{AGENT_NAME}] labels={BASE_LABELS}", flush=True)
-    print(f"[{AGENT_NAME}] capabilities={BASE_CAPABILITIES}", flush=True)
+    print(
+        f"[agent {AGENT_NAME}] starting. controller={CONTROLLER_URL}, "
+        f"labels={BASE_LABELS}, capabilities={CAPABILITIES}"
+    )
+    print(f"[agent {AGENT_NAME}] torch version: {torch.__version__}")
+    register_once()
 
-    _register_once()
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
 
-    hb = threading.Thread(target=_heartbeat_loop, daemon=True)
-    hb.start()
-
-    try:
-        _task_loop()
-    finally:
-        print(f"[{AGENT_NAME}] shutting down.", flush=True)
+    task_loop()
+    print(f"[agent {AGENT_NAME}] shutting down.")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,24 @@ from typing import Optional, List, Dict, Any
 
 import requests
 import torch
+import warnings
 from worker_sizing import build_worker_profile
+
+# ---------------- warning cleanup ----------------
+
+# Silence the constant Tesla M10 / CUDA capability noise from torch
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Tesla M10.*not compatible with the current PyTorch installation.*",
+    category=UserWarning,
+    module="torch.cuda",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Minimum and Maximum cuda capability supported by this version of PyTorch.*",
+    category=UserWarning,
+    module="torch.cuda",
+)
 
 # ---------------- config ----------------
 
@@ -29,7 +46,7 @@ def _stop(*_args):
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
-# ---------------- label helpers ----------------
+# ---------------- helpers: labels & GPU detection ----------------
 
 
 def _parse_labels(raw: str) -> Dict[str, Any]:
@@ -53,9 +70,9 @@ def _parse_labels(raw: str) -> Dict[str, Any]:
 
 def detect_gpu() -> Dict[str, Any]:
     """
-    Detect GPUs using both /dev/nvidia* and torch.cuda.
-    Returns a dict shaped like:
+    Detect GPUs using /dev/nvidia* and torch.cuda.
 
+    Returns:
         {
           "gpu_present": bool,
           "gpu_count": int,
@@ -73,11 +90,11 @@ def detect_gpu() -> Dict[str, Any]:
         "devices": [],
     }
 
-    # 1) /dev/nvidia* count
+    # 1) /dev/nvidia* device nodes
     try:
         import glob
 
-        gpu_indices = []
+        gpu_indices: List[int] = []
         for path in glob.glob("/dev/nvidia*"):
             base = os.path.basename(path)
             suffix = base.replace("nvidia", "", 1)
@@ -90,7 +107,7 @@ def detect_gpu() -> Dict[str, Any]:
     except Exception as e:
         info["dev_nodes_error"] = f"{type(e).__name__}: {e}"
 
-    # 2) Torch CUDA details (if usable)
+    # 2) torch.cuda details (if usable)
     try:
         if torch.cuda.is_available():
             device_count = torch.cuda.device_count()
@@ -113,6 +130,10 @@ def detect_gpu() -> Dict[str, Any]:
                 info["gpu_count"] = device_count
                 info["devices"] = devices
                 info["vram_gb"] = round(max(vram_list_gb), 2)
+
+            # Just to be explicit in logs which device index we'll use
+            torch.cuda.set_device(0)
+            print(f"[{AGENT_NAME}] Using device: cuda:{torch.cuda.current_device()}")
     except Exception as e:
         info["torch_cuda_error"] = f"{type(e).__name__}: {e}"
 
@@ -120,7 +141,7 @@ def detect_gpu() -> Dict[str, Any]:
     return info
 
 
-# Build worker profile and FORCE-IN our GPU info
+# Build worker profile and force-in GPU info
 try:
     base_profile = build_worker_profile()
 except Exception as e:
@@ -131,22 +152,20 @@ if not isinstance(base_profile, dict):
 
 GPU_INFO = detect_gpu()
 base_profile["gpu"] = GPU_INFO
-
 WORKER_PROFILE = base_profile
 
-# Flatten GPU info for controller labels
+# Flatten GPU info for labels
 gpu_names: Optional[List[str]] = None
 if GPU_INFO.get("devices"):
     gpu_names = [d.get("name") for d in GPU_INFO["devices"]]
 
 BASE_LABELS: Dict[str, Any] = {
-    "worker_profile": WORKER_PROFILE,
     "gpu_present": bool(GPU_INFO.get("gpu_present")),
     "gpu_count": int(GPU_INFO.get("gpu_count") or 0),
     "gpu_vram_gb": GPU_INFO.get("vram_gb"),
     "gpu_names": gpu_names,
+    "worker_profile": WORKER_PROFILE,
 }
-
 BASE_LABELS.update(_parse_labels(AGENT_LABELS_RAW))
 
 CAPABILITIES: Dict[str, Any] = {

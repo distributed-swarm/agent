@@ -1,11 +1,11 @@
-# Agent image for Neuro Fabric / distributed-swarm
+# Neuro Fabric / agent image
 
 FROM python:3.11-slim-bookworm
 
-# Avoid interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
 
-# Basic OS deps (curl so you can debug, plus build tools if pip ever needs them)
+# Basic system deps
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        curl \
@@ -13,23 +13,23 @@ RUN apt-get update \
        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Work in /app
+# Workdir
 WORKDIR /app
 
-# Copy requirements and install Python deps
+# Python deps
 COPY requirements.txt ./requirements.txt
 
 RUN if [ -s requirements.txt ]; then \
         pip install --no-cache-dir -r requirements.txt; \
     fi
 
-# Copy application code
+# App code
 COPY app.py worker_sizing.py ./
 
-# Make "python" and "python3" behave the same inside the container
+# Make "python" and "python3" behave the same
 RUN ln -s /usr/local/bin/python3 /usr/local/bin/python || true
 
-# Create non-root user
+# Non-root user
 RUN useradd -u 10001 -ms /bin/bash appuser \
     && chown -R appuser:appuser /app
 

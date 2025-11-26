@@ -12,16 +12,9 @@ from worker_sizing import build_worker_profile
 
 # ---------------- warning cleanup ----------------
 
-# Silence the constant Tesla M10 / CUDA capability noise from torch
+# Shut up torch.cuda UserWarnings (including the Tesla M10 spam)
 warnings.filterwarnings(
     "ignore",
-    message=r".*Tesla M10.*not compatible with the current PyTorch installation.*",
-    category=UserWarning,
-    module="torch.cuda",
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*Minimum and Maximum cuda capability supported by this version of PyTorch.*",
     category=UserWarning,
     module="torch.cuda",
 )
@@ -90,7 +83,7 @@ def detect_gpu() -> Dict[str, Any]:
         "devices": [],
     }
 
-    # 1) /dev/nvidia* device nodes
+    # 1) /dev/nvidia* device nodes (works even if torch is CPU-only)
     try:
         import glob
 
@@ -131,7 +124,7 @@ def detect_gpu() -> Dict[str, Any]:
                 info["devices"] = devices
                 info["vram_gb"] = round(max(vram_list_gb), 2)
 
-            # Just to be explicit in logs which device index we'll use
+            # Explicitly set device 0 for our work
             torch.cuda.set_device(0)
             print(f"[{AGENT_NAME}] Using device: cuda:{torch.cuda.current_device()}")
     except Exception as e:
@@ -141,7 +134,8 @@ def detect_gpu() -> Dict[str, Any]:
     return info
 
 
-# Build worker profile and force-in GPU info
+# ---------------- worker profile + labels ----------------
+
 try:
     base_profile = build_worker_profile()
 except Exception as e:
@@ -154,7 +148,6 @@ GPU_INFO = detect_gpu()
 base_profile["gpu"] = GPU_INFO
 WORKER_PROFILE = base_profile
 
-# Flatten GPU info for labels
 gpu_names: Optional[List[str]] = None
 if GPU_INFO.get("devices"):
     gpu_names = [d.get("name") for d in GPU_INFO["devices"]]

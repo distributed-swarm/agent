@@ -1,129 +1,165 @@
-import os 
-from math import floor
+import os
+import math
+import subprocess
+from typing import Dict, Any, List, Optional
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
-def _to_int(value, default=None):
+def _detect_cpu() -> Dict[str, Any]:
     """
-    Safe int converter for env variables.
+    Basic CPU sizing using psutil if available, otherwise os.cpu_count().
     """
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def calculate_cpu_workers(total_cores: int | None = None) -> dict:
-    """
-    Decide how many CPU workers this agent should use.
-
-    Rules:
-    - Detect cores if not provided.
-    - Reserve ~25% of cores for the OS / other stuff (min 1).
-    - Use the rest, minus 1, for workers (min 1).
-    - Allow overrides via:
-        AGENT_MAX_CPU_WORKERS
-        AGENT_MIN_CPU_WORKERS
-    """
-    if total_cores is None:
+    if psutil is not None:
+        try:
+            total_cores = psutil.cpu_count(logical=True) or 1
+        except Exception:
+            total_cores = os.cpu_count() or 1
+    else:
         total_cores = os.cpu_count() or 1
 
-    max_env = _to_int(os.getenv("AGENT_MAX_CPU_WORKERS"))
-    min_env = _to_int(os.getenv("AGENT_MIN_CPU_WORKERS"))
-
-    reserved_cores = max(1, floor(total_cores * 0.25))
+    # Reserve some cores for the system / Docker overhead
+    reserved_cores = min(4, max(1, total_cores // 4))
     usable_cores = max(1, total_cores - reserved_cores)
 
-    # automatic max (before env overrides)
-    auto_max = max(1, usable_cores - 1)
-
-    # start from automatic values
-    max_cpu_workers = auto_max
+    # Rough heuristic: up to 1 worker per usable core
+    max_cpu_workers = max(1, usable_cores)
     min_cpu_workers = 1
 
-    # apply env overrides if present
-    if max_env is not None:
-        max_cpu_workers = max(1, min(auto_max, max_env))
-
-    if min_env is not None:
-        min_cpu_workers = max(1, min_env)
-
-    # ensure consistency
-    if max_cpu_workers < min_cpu_workers:
-        max_cpu_workers = min_cpu_workers
-
     return {
-        "total_cores": total_cores,
-        "reserved_cores": reserved_cores,
-        "usable_cores": usable_cores,
-        "min_cpu_workers": min_cpu_workers,
-        "max_cpu_workers": max_cpu_workers,
+        "total_cores": int(total_cores),
+        "reserved_cores": int(reserved_cores),
+        "usable_cores": int(usable_cores),
+        "min_cpu_workers": int(min_cpu_workers),
+        "max_cpu_workers": int(max_cpu_workers),
     }
 
 
-def calculate_gpu_workers(
-    gpu_present: bool = False,
-    gpu_count: int = 0,
-    vram_gb: int | None = None,
-) -> dict:
+def _parse_nvidia_smi() -> List[Dict[str, Any]]:
     """
-    Decide how many GPU workers this agent should use.
+    Use `nvidia-smi` to detect GPUs and their memory.
 
-    Rules:
-    - If no GPU: 0 workers.
-    - Base: 1 worker per GPU.
-    - If vram_gb >= 16, allow up to 2 workers per GPU.
-    - Allow override via AGENT_MAX_GPU_WORKERS.
+    Returns a list of devices:
+      [
+        {
+          "index": 0,
+          "name": "NVIDIA GeForce RTX 3060",
+          "total_memory_bytes": 12486246400
+        },
+        ...
+      ]
+
+    If anything fails, returns [].
     """
-    max_gpu_workers = 0
+    try:
+        # Query: name + total memory (MiB), no units, no header
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except Exception:
+        return []
 
-    if gpu_present and gpu_count > 0:
-        # base
-        max_gpu_workers = gpu_count
+    devices: List[Dict[str, Any]] = []
+    for idx, line in enumerate(out.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        # Example line: "NVIDIA GeForce RTX 3060, 12288"
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        name, mem_str = parts
+        try:
+            mem_mib = float(mem_str)
+        except ValueError:
+            continue
+        total_bytes = int(mem_mib * 1024 * 1024)
+        devices.append(
+            {
+                "index": idx,
+                "name": name,
+                "total_memory_bytes": total_bytes,
+            }
+        )
+    return devices
 
-        # vram-based bump (simple rule for now)
-        if vram_gb is not None and vram_gb >= 16:
-            max_gpu_workers = gpu_count * 2
 
-    max_env = _to_int(os.getenv("AGENT_MAX_GPU_WORKERS"))
-    if max_env is not None:
-        max_gpu_workers = max(0, max_env)
+def _detect_gpu() -> Dict[str, Any]:
+    """
+    GPU sizing based on nvidia-smi only.
+
+    We don't care if PyTorch has CUDA or not here; this is purely for:
+      - worker_profile.gpu_present
+      - gpu_count
+      - vram_gb
+      - devices[...]
+
+    If no GPUs are visible to nvidia-smi, we report gpu_present = False.
+    """
+    devices = _parse_nvidia_smi()
+    if not devices:
+        return {
+            "gpu_present": False,
+            "gpu_count": 0,
+            "vram_gb": None,
+            "devices": [],
+            "max_gpu_workers": 0,
+        }
+
+    gpu_count = len(devices)
+    # Use the largest single-device memory as "vram_gb" for routing thresholds
+    max_bytes = max(d.get("total_memory_bytes", 0) for d in devices) or 0
+    vram_gb = max_bytes / float(1024 ** 3) if max_bytes > 0 else 0.0
+
+    # Simple heuristic: assume up to 1 worker per device by default
+    max_gpu_workers = gpu_count
 
     return {
-        "gpu_present": bool(gpu_present),
-        "gpu_count": int(gpu_count),
-        "vram_gb": vram_gb,
-        "max_gpu_workers": max_gpu_workers,
+        "gpu_present": True,
+        "gpu_count": gpu_count,
+        "vram_gb": round(vram_gb, 2),
+        "devices": devices,
+        "max_gpu_workers": int(max_gpu_workers),
     }
 
 
-def build_worker_profile(
-    total_cores: int | None = None,
-    gpu_present: bool = False,
-    gpu_count: int = 0,
-    vram_gb: int | None = None,
-) -> dict:
+def build_worker_profile() -> Dict[str, Any]:
     """
-    Build the combined worker profile for this agent.
+    Combined CPU + GPU + worker sizing.
 
-    This is what we will expose to the controller/UI.
+    Shape is what the controller & UI already expect:
+
+      {
+        "cpu": {...},
+        "gpu": {...},
+        "workers": {
+          "max_total_workers": int,
+          "current_workers": 0
+        }
+      }
     """
-    cpu_info = calculate_cpu_workers(total_cores=total_cores)
-    gpu_info = calculate_gpu_workers(
-        gpu_present=gpu_present,
-        gpu_count=gpu_count,
-        vram_gb=vram_gb,
-    )
+    cpu_info = _detect_cpu()
+    gpu_info = _detect_gpu()
 
-    max_total_workers = cpu_info["max_cpu_workers"] + gpu_info["max_gpu_workers"]
+    # Total worker limit: use CPU max workers as upper bound for now.
+    max_total_workers = cpu_info.get("max_cpu_workers", 1)
+    if isinstance(max_total_workers, float):
+        max_total_workers = int(math.floor(max_total_workers))
+
+    if max_total_workers < 1:
+        max_total_workers = 1
 
     return {
         "cpu": cpu_info,
         "gpu": gpu_info,
         "workers": {
-            "max_total_workers": max_total_workers,
-            # this will be updated by the agent's worker manager later
+            "max_total_workers": int(max_total_workers),
             "current_workers": 0,
         },
     }

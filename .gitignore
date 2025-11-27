@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local backup files (do not track)
+app.local.backup.py
+app.py.bak-gpu-20251126
+requirements.local.backup.txt

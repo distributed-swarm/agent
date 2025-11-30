@@ -34,6 +34,14 @@ MODEL_NAME = os.getenv(
 
 _running = True
 
+# ---------------- Local metrics tracking ----------------
+
+_metrics_lock = threading.Lock()
+_tasks_completed = 0
+_tasks_failed = 0
+_task_durations: List[float] = []
+_max_duration_samples = 100  # Rolling window size
+
 # ---------------- worker profile / labels ----------------
 
 WORKER_PROFILE = build_worker_profile()
@@ -154,28 +162,54 @@ OPS = {
 # ---------------- metrics helpers ----------------
 
 
+def _record_task_result(duration_ms: float, ok: bool) -> None:
+    """
+    Record the result of a task execution for local metrics tracking.
+    Thread-safe.
+    """
+    global _tasks_completed, _tasks_failed, _task_durations
+
+    with _metrics_lock:
+        if ok:
+            _tasks_completed += 1
+        else:
+            _tasks_failed += 1
+
+        _task_durations.append(duration_ms)
+        # Keep only the last N samples for rolling average
+        if len(_task_durations) > _max_duration_samples:
+            _task_durations.pop(0)
+
+
 def _collect_metrics() -> Dict[str, Any]:
     """
     Collect lightweight agent metrics for autonomic decisions.
+    Includes both system metrics (CPU, RAM) and task performance metrics.
     """
     metrics: Dict[str, Any] = {}
 
-    if psutil is None:
-        return metrics
+    # System metrics via psutil
+    if psutil is not None:
+        try:
+            metrics["cpu_util"] = psutil.cpu_percent(interval=0.0) / 100.0
+        except Exception:
+            pass
 
-    try:
-        metrics["cpu_util"] = psutil.cpu_percent(interval=0.0) / 100.0
-    except Exception:
-        pass
+        try:
+            vm = psutil.virtual_memory()
+            metrics["ram_mb"] = int(vm.used / (1024 * 1024))
+        except Exception:
+            pass
 
-    try:
-        vm = psutil.virtual_memory()
-        metrics["ram_mb"] = int(vm.used / (1024 * 1024))
-    except Exception:
-        pass
+    # Task performance metrics
+    with _metrics_lock:
+        metrics["tasks_completed"] = _tasks_completed
+        metrics["tasks_failed"] = _tasks_failed
 
-    # The controller also tracks task-level metrics from /result.
-    # We can extend this later with moving averages if needed.
+        if _task_durations:
+            avg_ms = sum(_task_durations) / len(_task_durations)
+            metrics["avg_task_ms"] = avg_ms
+
     return metrics
 
 
@@ -278,6 +312,9 @@ def worker_loop() -> None:
 
         ok = bool(result_data.get("ok", True))
         error_str = result_data.get("error")
+
+        # Record metrics locally
+        _record_task_result(duration_ms, ok)
 
         result_payload: Dict[str, Any] = {
             "id": job_id,

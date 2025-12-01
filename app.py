@@ -254,7 +254,8 @@ def register_agent() -> None:
         "capabilities": CAPABILITIES,
         "worker_profile": WORKER_PROFILE,
     }
-    payload.update(_collect_metrics())
+    # send metrics as a dedicated sub-dict
+    payload["metrics"] = _collect_metrics()
     print(f"[agent] registering with controller as {AGENT_NAME}")
     _post_json("/agents/register", payload)
 
@@ -267,7 +268,8 @@ def heartbeat_loop() -> None:
             "capabilities": CAPABILITIES,
             "worker_profile": WORKER_PROFILE,
         }
-        payload.update(_collect_metrics())
+        # send metrics as a dedicated sub-dict
+        payload["metrics"] = _collect_metrics()
         _post_json("/agents/heartbeat", payload)
         time.sleep(HEARTBEAT_SEC)
 

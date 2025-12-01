@@ -3,7 +3,7 @@ Basic op registry for Base Agent v2.
 
 This file defines a simple registry that other modules can use to
 register operation handlers. For now we also eagerly register the
-built-in map_classify op.
+built-in ops like map_classify and map_summarize.
 """
 
 from typing import Any, Callable, Dict
@@ -39,4 +39,14 @@ try:
 except Exception:
     # During early wiring / tests we don't want the whole agent to explode
     # just because one op module has an import error.
+    pass
+
+# Import map_summarize so it is also registered at startup.
+try:
+    from . import map_summarize
+
+    register_op(map_summarize.OP_NAME, map_summarize.handle)
+except Exception:
+    # Same idea: if summarization wiring is broken, don't kill the whole agent.
+    # The op just won't be available until it's fixed.
     pass

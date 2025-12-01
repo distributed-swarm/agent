@@ -9,6 +9,7 @@ on:
       - worker_sizing.py
       - requirements.txt
       - .github/workflows/publish.yml
+      - ops/**
   workflow_dispatch:
 
 permissions:

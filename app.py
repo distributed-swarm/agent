@@ -13,10 +13,8 @@ try:
 except ImportError:
     psutil = None
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
 from worker_sizing import build_worker_profile
+from ops import list_ops, get_op  # plugin-based ops registry
 
 # ---------------- config ----------------
 
@@ -26,11 +24,6 @@ HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
 TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))
 AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
-
-MODEL_NAME = os.getenv(
-    "CLASSIFY_MODEL",
-    "assemblyai/distilbert-base-uncased-sst2",
-)
 
 _running = True
 
@@ -62,101 +55,9 @@ if AGENT_LABELS_RAW.strip():
 # Always include worker_profile in labels for the controller
 BASE_LABELS["worker_profile"] = WORKER_PROFILE
 
+# CAPABILITIES now come from plugin registry (ops/)
 CAPABILITIES: Dict[str, Any] = {
-    "ops": ["map_tokenize", "map_classify"]
-}
-
-# ---------------- model / op registry ----------------
-
-_model_lock = threading.Lock()
-_classifier_tokenizer: Optional[AutoTokenizer] = None
-_classifier_model: Optional[AutoModelForSequenceClassification] = None
-_classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _load_classifier_if_needed():
-    global _classifier_tokenizer, _classifier_model
-    with _model_lock:
-        if _classifier_tokenizer is not None and _classifier_model is not None:
-            return
-
-        print(f"[agent] loading classifier model: {MODEL_NAME} on {_classifier_device}")
-        _classifier_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        _classifier_model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-        _classifier_model.to(_classifier_device)
-        _classifier_model.eval()
-
-
-def op_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Very simple "tokenization" op.
-
-    Payload:
-      { "text": "some text" }
-
-    Result:
-      { "ok": true, "tokens": [...], "length": int }
-    """
-    text = str(payload.get("text", ""))
-    tokens = text.split()
-    return {
-        "ok": True,
-        "tokens": tokens,
-        "length": len(tokens),
-    }
-
-
-def op_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Sentiment classification using HF model.
-
-    Payload:
-      { "text": "some text" }
-
-    Result includes:
-      - label
-      - score
-      - raw logits (optional)
-    """
-    text = str(payload.get("text", ""))
-
-    if not text.strip():
-        return {
-            "ok": True,
-            "label": "NEUTRAL",
-            "score": 0.0,
-            "detail": "empty text",
-        }
-
-    _load_classifier_if_needed()
-    assert _classifier_tokenizer is not None
-    assert _classifier_model is not None
-
-    inputs = _classifier_tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-    ).to(_classifier_device)
-
-    with torch.no_grad():
-        outputs = _classifier_model(**inputs)
-        logits = outputs.logits[0]
-        probs = torch.softmax(logits, dim=-1)
-        score, idx = torch.max(probs, dim=-1)
-        label = _classifier_model.config.id2label[int(idx)]
-
-    return {
-        "ok": True,
-        "label": label,
-        "score": float(score),
-        "logits": [float(x) for x in logits.tolist()],
-    }
-
-
-OPS = {
-    "map_tokenize": op_map_tokenize,
-    "map_classify": op_map_classify,
+    "ops": list_ops()
 }
 
 # ---------------- metrics helpers ----------------
@@ -278,7 +179,16 @@ def heartbeat_loop() -> None:
 
 
 def _execute_op(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    fn = OPS.get(op)
+    """
+    Generic dispatcher using the ops plugin registry.
+
+    Contract with ops handlers:
+      - handler(payload: Dict[str, Any]) -> Dict[str, Any]
+      - returned dict SHOULD include "ok": bool
+        - if missing, we assume ok=True
+      - may include "error": str on failure
+    """
+    fn = get_op(op)
     if fn is None:
         return {
             "ok": False,
@@ -286,7 +196,19 @@ def _execute_op(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     try:
-        return fn(payload)
+        result = fn(payload)
+        # Normalize in case handler forgot "ok"
+        if not isinstance(result, dict):
+            # wrap non-dict results
+            return {
+                "ok": True,
+                "value": result,
+            }
+
+        if "ok" not in result:
+            result = {**result, "ok": True}
+
+        return result
     except Exception as e:
         return {
             "ok": False,

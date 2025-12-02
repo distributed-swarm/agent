@@ -13,18 +13,17 @@ RUN apt-get update \
        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Workdir
+# Workdir for the agent code
 WORKDIR /app
 
-# Python deps
-COPY requirements.txt ./requirements.txt
-
-RUN if [ -s requirements.txt ]; then \
-        pip install --no-cache-dir -r requirements.txt; \
-    fi
+# Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
 COPY app.py worker_sizing.py ./
+# 🔴 This was missing before: ship the ops package into the image
+COPY ops ./ops
 
 # Make "python" and "python3" behave the same
 RUN ln -s /usr/local/bin/python3 /usr/local/bin/python || true

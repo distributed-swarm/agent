@@ -12,7 +12,10 @@ from typing import Any, Callable, Dict, Optional
 OPS_REGISTRY: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
 
 
-def register_op(name: str, handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None):
+def register_op(
+    name: str,
+    handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+):
     """
     Register an op handler.
 
@@ -56,29 +59,38 @@ def list_ops():
 # Built-in ops
 # ------------------------------------------------------------------
 
-# Import map_classify so we can register it in the global registry.
-try:
-    from . import map_classify
 
-    # If it exposes OP_NAME/handle, register that explicitly.
-    if hasattr(map_classify, "OP_NAME") and hasattr(map_classify, "handle"):
-        register_op(map_classify.OP_NAME, map_classify.handle)
-except Exception:
-    # During early wiring / tests we don't want the whole agent to explode
-    # just because one op module has an import error.
-    pass
+def _safe_register_builtins():
+    """
+    Try to register built-ins in a backward-compatible way.
+
+    We support:
+      - New style: module has OP_NAME + handle(task: dict)
+      - Old style: module has map_classify(task) / map_summarize(task)
+    """
+    # ---- map_classify ----
+    try:
+        from . import map_classify as mc  # type: ignore
+
+        if hasattr(mc, "OP_NAME") and hasattr(mc, "handle"):
+            register_op(mc.OP_NAME, mc.handle)
+        elif hasattr(mc, "map_classify"):
+            register_op("map_classify", mc.map_classify)  # old-style
+    except Exception:
+        # Don't kill the agent just because one op is broken.
+        pass
+
+    # ---- map_summarize ----
+    try:
+        from . import map_summarize as ms  # type: ignore
+
+        if hasattr(ms, "OP_NAME") and hasattr(ms, "handle"):
+            register_op(ms.OP_NAME, ms.handle)
+        elif hasattr(ms, "map_summarize"):
+            register_op("map_summarize", ms.map_summarize)  # old-style
+    except Exception:
+        # Same idea: summarization wiring issues shouldn't kill the agent.
+        pass
 
 
-# Import map_summarize so it is also registered at startup.
-try:
-    from . import map_summarize
-
-    # If the module defines OP_NAME/handle, register explicitly.
-    # If instead it uses @register_op("map_summarize") decorator,
-    # importing it is enough for the decorator to run.
-    if hasattr(map_summarize, "OP_NAME") and hasattr(map_summarize, "handle"):
-        register_op(map_summarize.OP_NAME, map_summarize.handle)
-except Exception:
-    # Same idea: if summarization wiring is broken, don't kill the whole agent.
-    # The op just won't be available until it's fixed.
-    pass
+_safe_register_builtins()

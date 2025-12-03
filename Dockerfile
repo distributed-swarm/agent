@@ -16,13 +16,15 @@ RUN apt-get update \
 # Workdir for the agent code
 WORKDIR /app
 
-# Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Python deps
+COPY requirements.txt ./requirements.txt
 
-# App code
-COPY app.py worker_sizing.py ./
-# 🔴 This was missing before: ship the ops package into the image
+RUN if [ -s requirements.txt ]; then \
+      pip install --no-cache-dir -r requirements.txt; \
+    fi
+
+# Agent code
+COPY app.py worker_sizing.py ./ 
 COPY ops ./ops
 
 # Make "python" and "python3" behave the same

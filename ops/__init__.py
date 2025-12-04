@@ -1,20 +1,45 @@
-# ops/__init__.py
+cd ~/projects/agent
 
-from .map_classify import handle as map_classify_handle
-from .map_summarize import handle as map_summarize_handle
+cat << 'EOF' > ops/__init__.py
+from typing import Callable, Dict, Any
 
-OPS_REGISTRY = {
-    "map_classify": map_classify_handle,
-    "map_summarize": map_summarize_handle,
-}
+# Global registry of ops
+OPS_REGISTRY: Dict[str, Callable[..., Any]] = {}
+
+
+def register_op(name: str):
+    """
+    Decorator to register an op handler function.
+
+    Usage:
+
+        @register_op("map_summarize")
+        def handle(task):
+            ...
+    """
+    def decorator(fn: Callable[..., Any]):
+        OPS_REGISTRY[name] = fn
+        return fn
+    return decorator
 
 
 def list_ops():
+    """Return list of registered op names."""
     return sorted(OPS_REGISTRY.keys())
 
 
-def get_op(name: str):
+def get_op(name: str) -> Callable[..., Any]:
+    """Return the handler function for a given op name."""
     handler = OPS_REGISTRY.get(name)
     if handler is None:
-        raise ValueError(f"Unknown op {name!r}")
+        raise ValueError(f"Unknown op {name!r}. Registered ops: {list(OPS_REGISTRY.keys())}")
     return handler
+
+
+# Import op modules so their @register_op decorators run.
+# These imports MUST come after register_op is defined to avoid circular imports.
+from . import map_classify  # noqa: F401
+from . import map_summarize  # noqa: F401
+# If you also have map_tokenize, keep this; otherwise you can remove it:
+from . import map_tokenize  # noqa: F401
+EOF

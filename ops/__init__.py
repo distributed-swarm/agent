@@ -1,4 +1,3 @@
-cat << 'EOF' > ops/__init__.py
 from typing import Callable, Dict, Any
 
 # Global registry of ops

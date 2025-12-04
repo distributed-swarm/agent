@@ -28,10 +28,14 @@ def get_op(name: str) -> Callable[..., Any]:
 
 
 # Import op modules so their @register_op decorators run.
+# If these imports succeed, the functions will add themselves to OPS_REGISTRY.
+
+from . import echo          # noqa: F401
 from . import map_classify  # noqa: F401
 from . import map_summarize  # noqa: F401
+
+# Optional op, don't die if it's missing
 try:
     from . import map_tokenize  # noqa: F401
 except ImportError:
-    # Optional op, don't die if it's missing
     pass

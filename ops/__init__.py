@@ -1,5 +1,3 @@
-cd ~/projects/agent
-
 cat << 'EOF' > ops/__init__.py
 from typing import Callable, Dict, Any
 
@@ -10,8 +8,6 @@ OPS_REGISTRY: Dict[str, Callable[..., Any]] = {}
 def register_op(name: str):
     """
     Decorator to register an op handler function.
-
-    Usage:
 
         @register_op("map_summarize")
         def handle(task):
@@ -40,6 +36,5 @@ def get_op(name: str) -> Callable[..., Any]:
 # These imports MUST come after register_op is defined to avoid circular imports.
 from . import map_classify  # noqa: F401
 from . import map_summarize  # noqa: F401
-# If you also have map_tokenize, keep this; otherwise you can remove it:
 from . import map_tokenize  # noqa: F401
 EOF

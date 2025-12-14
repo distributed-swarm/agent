@@ -28,7 +28,6 @@ def get_op(name: str) -> Callable[..., Any]:
 
 
 # Import op modules so their @register_op decorators run.
-# If these imports succeed, the functions will add themselves to OPS_REGISTRY.
 
 from . import echo          # noqa: F401
 from . import map_classify  # noqa: F401
@@ -39,3 +38,6 @@ try:
     from . import map_tokenize  # noqa: F401
 except ImportError:
     pass
+
+# New CSV shard op
+from . import csv_shard  # noqa: F401

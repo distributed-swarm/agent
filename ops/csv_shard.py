@@ -3,6 +3,8 @@
 import csv
 from typing import Any, Dict, List
 
+from . import register_op
+
 
 def _read_csv_shard(source_uri: str, start_row: int, shard_size: int) -> List[Dict[str, Any]]:
     """
@@ -24,6 +26,7 @@ def _read_csv_shard(source_uri: str, start_row: int, shard_size: int) -> List[Di
     return rows
 
 
+@register_op("read_csv_shard")
 def op_read_csv_shard(task: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generic CSV shard op.

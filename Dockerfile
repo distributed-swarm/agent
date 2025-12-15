@@ -26,6 +26,7 @@ RUN if [ -s requirements.txt ]; then \
 # Agent code
 COPY app.py worker_sizing.py ./ 
 COPY ops ./ops
+RUN python -c "import ops; print('ops import OK')"
 
 # Make "python" and "python3" behave the same
 RUN ln -s /usr/local/bin/python3 /usr/local/bin/python || true

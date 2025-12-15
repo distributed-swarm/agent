@@ -27,23 +27,28 @@ def _read_csv_shard(source_uri: str, start_row: int, shard_size: int) -> List[Di
 
 
 @register_op("read_csv_shard")
-def op_read_csv_shard(task: Dict[str, Any]) -> Dict[str, Any]:
+def op_read_csv_shard(task_or_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generic CSV shard op.
 
-    Expected payload:
-      {
-        "dataset_id": "inc5000_2019",
-        "source_uri": "/path/to/file.csv",
-        "start_row": 0,
-        "shard_size": 100,
-        "mode": "rows" | "count"
-      }
+    Accepts either:
+      A) payload dict directly (agent current behavior)
+         {
+           "dataset_id": "...",
+           "source_uri": "...",
+           "start_row": 0,
+           "shard_size": 100,
+           "mode": "rows" | "count"
+         }
+
+      B) full task dict containing "payload"
+         { "payload": { ... } }
     """
-    payload = task.get("payload", {})
+    # If we're handed a full task, extract payload; otherwise treat the input as payload.
+    payload = task_or_payload.get("payload") if "payload" in task_or_payload else task_or_payload
 
     dataset_id = payload.get("dataset_id", "unknown_dataset")
-    source_uri = payload["source_uri"]          # required
+    source_uri = payload["source_uri"]  # required
     start_row = int(payload.get("start_row", 0))
     shard_size = int(payload.get("shard_size", 100))
     mode = payload.get("mode", "rows")

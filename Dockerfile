@@ -11,12 +11,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        curl \
        ca-certificates \
+       libgomp1 \
     && rm -rf /var/lib/apt/lists/*
-
-# If you later need to compile wheels, uncomment this:
-# RUN apt-get update \
-#     && apt-get install -y --no-install-recommends build-essential \
-#     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

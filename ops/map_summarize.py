@@ -16,16 +16,9 @@ def handle(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Map-style summarization handler (placeholder truncation).
 
-    Expected payload:
-      {
-        "items": [
-          { "id": "demo-1", "text": "..." },
-          { "id": "demo-2", "document": "..." },
-          { "id": "demo-3", "body": "..." },
-          ...
-        ],
-        "params": { ... }   # optional, ignored for now
-      }
+    Accepts either:
+      - {"items": [ {id,text|document|body}, ... ]}
+      - {"text": "..."}  (single convenience)
 
     Returns:
       {"ok": true, "items": [{"id": "...", "summary": "..."}, ...]}
@@ -34,6 +27,13 @@ def handle(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     if payload is None:
         payload = {}
+
+    # Convenience: single text payload
+    if "text" in payload and payload.get("text") is not None and "items" not in payload:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": "map_summarize: payload.text must be a non-empty string"}
+        return {"ok": True, "items": [{"id": payload.get("id"), "summary": _summarize_placeholder(text)}]}
 
     items = payload.get("items") or []
     if not isinstance(items, list):

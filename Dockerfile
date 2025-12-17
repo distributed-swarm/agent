@@ -1,35 +1,36 @@
 # Neuro Fabric / agent image
-
 FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Basic system deps
+# Basic system deps (keep minimal)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        curl \
        ca-certificates \
-       build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Workdir for the agent code
+# If you later need to compile wheels, uncomment this:
+# RUN apt-get update \
+#     && apt-get install -y --no-install-recommends build-essential \
+#     && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Python deps
 COPY requirements.txt ./requirements.txt
-
-RUN if [ -s requirements.txt ]; then \
-      pip install --no-cache-dir -r requirements.txt; \
-    fi
+RUN python -m pip install --upgrade pip \
+    && if [ -s requirements.txt ]; then python -m pip install -r requirements.txt; fi
 
 # Agent code
-COPY app.py worker_sizing.py ./ 
+COPY app.py worker_sizing.py ./
 COPY ops ./ops
-RUN python -c "import ops; print('ops import OK')"
 
-# Make "python" and "python3" behave the same
-RUN ln -s /usr/local/bin/python3 /usr/local/bin/python || true
+# Sanity: ensure ops import works at build time
+RUN python -c "import ops; print('ops import OK')"
 
 # Non-root user
 RUN useradd -u 10001 -ms /bin/bash appuser \
@@ -37,5 +38,4 @@ RUN useradd -u 10001 -ms /bin/bash appuser \
 
 USER appuser
 
-# Default command: run the agent
 CMD ["python", "/app/app.py"]

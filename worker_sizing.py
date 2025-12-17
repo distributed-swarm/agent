@@ -1,7 +1,7 @@
 import os
 import math
 import subprocess
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 try:
     import psutil
@@ -38,24 +38,38 @@ def _detect_cpu() -> Dict[str, Any]:
     }
 
 
+def _nvidia_visible_devices_allows_gpu() -> bool:
+    """
+    NVIDIA container runtime convention:
+      - NVIDIA_VISIBLE_DEVICES=none  -> no GPUs exposed
+      - empty / unset               -> depends, but assume allowed
+      - "all" or list of ids        -> allowed
+    """
+    v = os.getenv("NVIDIA_VISIBLE_DEVICES")
+    if v is None:
+        return True
+    v = str(v).strip().lower()
+    if v in ("", "void"):
+        # Treat empty/void as "not explicitly blocked"
+        return True
+    if v == "none":
+        return False
+    return True
+
+
 def _parse_nvidia_smi() -> List[Dict[str, Any]]:
     """
     Use `nvidia-smi` to detect GPUs and their memory.
 
     Returns a list of devices:
       [
-        {
-          "index": 0,
-          "name": "NVIDIA GeForce RTX 3060",
-          "total_memory_bytes": 12486246400
-        },
+        {"index": 0, "name": "...", "total_memory_bytes": 123},
         ...
       ]
 
     If anything fails, returns [].
     """
     try:
-        # Query: name + total memory (MiB), no units, no header
         cmd = [
             "nvidia-smi",
             "--query-gpu=name,memory.total",
@@ -70,7 +84,6 @@ def _parse_nvidia_smi() -> List[Dict[str, Any]]:
         line = line.strip()
         if not line:
             continue
-        # Example line: "NVIDIA GeForce RTX 3060, 12288"
         parts = [p.strip() for p in line.split(",")]
         if len(parts) != 2:
             continue
@@ -94,14 +107,24 @@ def _detect_gpu() -> Dict[str, Any]:
     """
     GPU sizing based on nvidia-smi only.
 
-    We don't care if PyTorch has CUDA or not here; this is purely for:
-      - worker_profile.gpu_present
+    Reports:
+      - gpu_present
       - gpu_count
-      - vram_gb
-      - devices[...]
+      - vram_gb (largest device VRAM in GiB, rounded)
+      - devices[]
+      - max_gpu_workers
 
-    If no GPUs are visible to nvidia-smi, we report gpu_present = False.
+    If no GPUs are visible (or explicitly blocked), gpu_present=False.
     """
+    if not _nvidia_visible_devices_allows_gpu():
+        return {
+            "gpu_present": False,
+            "gpu_count": 0,
+            "vram_gb": None,
+            "devices": [],
+            "max_gpu_workers": 0,
+        }
+
     devices = _parse_nvidia_smi()
     if not devices:
         return {
@@ -113,17 +136,17 @@ def _detect_gpu() -> Dict[str, Any]:
         }
 
     gpu_count = len(devices)
-    # Use the largest single-device memory as "vram_gb" for routing thresholds
-    max_bytes = max(d.get("total_memory_bytes", 0) for d in devices) or 0
-    vram_gb = max_bytes / float(1024 ** 3) if max_bytes > 0 else 0.0
 
-    # Simple heuristic: assume up to 1 worker per device by default
+    max_bytes = max(int(d.get("total_memory_bytes", 0) or 0) for d in devices)
+    vram_gb = (max_bytes / float(1024 ** 3)) if max_bytes > 0 else None
+
+    # Simple heuristic: 1 worker per visible GPU device
     max_gpu_workers = gpu_count
 
     return {
         "gpu_present": True,
-        "gpu_count": gpu_count,
-        "vram_gb": round(vram_gb, 2),
+        "gpu_count": int(gpu_count),
+        "vram_gb": (round(vram_gb, 2) if vram_gb is not None else None),
         "devices": devices,
         "max_gpu_workers": int(max_gpu_workers),
     }
@@ -138,22 +161,21 @@ def build_worker_profile() -> Dict[str, Any]:
       {
         "cpu": {...},
         "gpu": {...},
-        "workers": {
-          "max_total_workers": int,
-          "current_workers": 0
-        }
+        "workers": {"max_total_workers": int, "current_workers": 0}
       }
     """
     cpu_info = _detect_cpu()
     gpu_info = _detect_gpu()
 
-    # Total worker limit: use CPU max workers as upper bound for now.
-    max_total_workers = cpu_info.get("max_cpu_workers", 1)
-    if isinstance(max_total_workers, float):
-        max_total_workers = int(math.floor(max_total_workers))
+    cpu_max = cpu_info.get("max_cpu_workers", 1)
+    if isinstance(cpu_max, float):
+        cpu_max = int(math.floor(cpu_max))
+    cpu_max = max(1, int(cpu_max))
 
-    if max_total_workers < 1:
-        max_total_workers = 1
+    gpu_max = int(gpu_info.get("max_gpu_workers", 0) or 0)
+
+    # Total worker limit: allow CPU + GPU workers (controller can still cap/reroute).
+    max_total_workers = max(1, cpu_max + gpu_max)
 
     return {
         "cpu": cpu_info,

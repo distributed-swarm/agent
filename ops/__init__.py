@@ -55,11 +55,12 @@ def try_get_op(name: str) -> Optional[Callable[..., Any]]:
 
 # Import op modules so their @register_op decorators run.
 # Core ops (should always exist in the image)
-from . import echo          # noqa: F401
-from . import map_tokenize  # noqa: F401
-from . import map_summarize # noqa: F401
-from . import csv_shard     # noqa: F401
-from . import map_classify  # noqa: F401
+from . import echo            # noqa: F401
+from . import map_tokenize    # noqa: F401
+from . import map_summarize   # noqa: F401
+from . import csv_shard       # noqa: F401
+from . import map_classify    # noqa: F401
+from . import risk_accumulate # noqa: F401
 
 # If you later add truly optional ops, do it like this:
 # try:

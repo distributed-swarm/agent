@@ -1,37 +1,61 @@
 # ops/map_tokenize.py
-from typing import Dict, Any, List
-from . import register_op 
+from typing import Dict, Any, List, Union
+from . import register_op
+
+
+def _chunk_text(text: str, chunk_size: int) -> List[str]:
+    if not text:
+        return []
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
 
 @register_op("map_tokenize")
 def map_tokenize_op(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Slices text into fixed-size chunks (default 1KB).
-    Enable L2 Pipeline: Lite Agent (CPU) prepares data for Heavy Agent (GPU).
+    Supports either:
+      - {"text": "..."} or {"data": "..."}
+      - {"items": ["...", "..."], "chunk_size": 1024}
     """
 
-    text = payload.get("text") or payload.get("data", "")
-    
-    # 1. Configurable Chunk Size (Default 1024 chars ~= 1KB)
+    if payload is None:
+        payload = {}
+
     chunk_size = payload.get("chunk_size", 1024)
+    if not isinstance(chunk_size, int) or chunk_size <= 0:
+        return {"ok": False, "error": "payload.chunk_size must be a positive integer"}
 
-    if not isinstance(text, str):
+    # NEW: list input support
+    if "items" in payload and payload["items"] is not None:
+        items = payload["items"]
+        if not isinstance(items, list):
+            return {"ok": False, "error": "payload.items must be a list of strings"}
+
+        all_chunks: List[str] = []
+        total_chars = 0
+
+        for x in items:
+            s = "" if x is None else str(x)
+            total_chars += len(s)
+            all_chunks.extend(_chunk_text(s, chunk_size))
+
         return {
-            "ok": False,
-            "error": "payload.text must be a string"
+            "ok": True,
+            "tokens": all_chunks,      # flattened list of chunks
+            "count": len(all_chunks),  # number of chunks produced
+            "total_chars": total_chars,
+            "items_count": len(items),
         }
-    
-    if not text:
-        return {"ok": True, "tokens": [], "count": 0}
 
-    # 2. The Chunking Logic (Slicing instead of splitting)
-    # This creates the "L2 Packets" for your pipeline
-    chunks = []
-    for i in range(0, len(text), chunk_size):
-        chunks.append(text[i:i + chunk_size])
+    # Existing single-text behavior (text/data)
+    text = payload.get("text") or payload.get("data", "")
+    if not isinstance(text, str):
+        return {"ok": False, "error": "payload.text must be a string"}
 
+    chunks = _chunk_text(text, chunk_size)
     return {
         "ok": True,
-        "tokens": chunks,     # The list of 1KB strings
-        "count": len(chunks), # How many jobs this creates
-        "total_chars": len(text)
+        "tokens": chunks,
+        "count": len(chunks),
+        "total_chars": len(text),
     }

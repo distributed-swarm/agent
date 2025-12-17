@@ -1,54 +1,62 @@
 # ops/map_summarize.py
+from typing import Any, Dict, List, Optional
 
-from . import register_op # <--- STEP 1: IMPORT THE REGISTRATION FUNCTION
+from . import register_op
 
-@register_op("map_summarize") # <--- STEP 2: USE THE DECORATOR TO REGISTER THE FUNCTION
-def handle(payload):
+
+def _summarize_placeholder(text: str, max_len: int = 200) -> str:
+    s = text.strip()
+    if len(s) > max_len:
+        s = s[: max_len - 3].rstrip() + "..."
+    return s
+
+
+@register_op("map_summarize")
+def handle(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Map-style summarization handler.
+    Map-style summarization handler (placeholder truncation).
 
-    Expected payload shape:
+    Expected payload:
       {
         "items": [
           { "id": "demo-1", "text": "..." },
-          { "id": "demo-2", "text": "..." },
+          { "id": "demo-2", "document": "..." },
+          { "id": "demo-3", "body": "..." },
           ...
         ],
-        "params": { ... }   # optional
+        "params": { ... }   # optional, ignored for now
       }
+
+    Returns:
+      {"ok": true, "items": [{"id": "...", "summary": "..."}, ...]}
+    or:
+      {"ok": false, "error": "..."}
     """
+    if payload is None:
+        payload = {}
+
     items = payload.get("items") or []
     if not isinstance(items, list):
-        raise ValueError("Expected 'items' to be a list for map_summarize")
+        return {"ok": False, "error": "map_summarize: payload.items must be a list"}
 
-    # NOTE: You need actual model loading and processing here!
-    # The current code is just a simple string truncation placeholder.
+    results: List[Dict[str, Any]] = []
 
-    results = []
-
-    for item in items:
-        text = None
+    for idx, item in enumerate(items):
         item_id = None
+        text = None
 
         if isinstance(item, dict):
             item_id = item.get("id")
-            # Note: The original code used .get("text") or .get("document") or .get("body")
-            # We'll stick to the original logic for now.
             text = item.get("text") or item.get("document") or item.get("body")
         else:
-            # Fallback: treat item itself as text
             text = str(item)
 
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("No text string provided in 'text'/'document'/'body'.")
+            return {
+                "ok": False,
+                "error": f"map_summarize: item[{idx}] missing non-empty text in text/document/body",
+            }
 
-        summary = text.strip()
-        if len(summary) > 200:
-            summary = summary[:197].rstrip() + "..."
+        results.append({"id": item_id, "summary": _summarize_placeholder(text)})
 
-        results.append({
-            "id": item_id,
-            "summary": summary,
-        })
-
-    return {"items": results}
+    return {"ok": True, "items": results}

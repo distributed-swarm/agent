@@ -3,7 +3,7 @@ import time
 import socket
 import signal
 import threading
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 
@@ -18,11 +18,17 @@ from ops import list_ops, get_op  # plugin-based ops registry
 
 # ---------------- config ----------------
 
-CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080")
+CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080").rstrip("/")
 AGENT_NAME = os.getenv("AGENT_NAME", socket.gethostname())
+
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
 TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))
+
+# If controller is down, avoid hot-loop + log spam
+ERROR_LOG_EVERY_SEC = float(os.getenv("ERROR_LOG_EVERY_SEC", "10"))
+ERROR_BACKOFF_SEC = float(os.getenv("ERROR_BACKOFF_SEC", "1.0"))
+
 AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
 
 _running = True
@@ -44,32 +50,39 @@ BASE_LABELS: Dict[str, Any] = {}
 # Parse AGENT_LABELS="key=value,key2=value2"
 if AGENT_LABELS_RAW.strip():
     for item in AGENT_LABELS_RAW.split(","):
-        if not item.strip():
+        item = item.strip()
+        if not item:
             continue
         if "=" in item:
             k, v = item.split("=", 1)
             BASE_LABELS[k.strip()] = v.strip()
         else:
-            BASE_LABELS[item.strip()] = True
+            BASE_LABELS[item] = True
 
 # Always include worker_profile in labels for the controller
 BASE_LABELS["worker_profile"] = WORKER_PROFILE
 
 # CAPABILITIES now come from plugin registry (ops/)
-CAPABILITIES: Dict[str, Any] = {
-    "ops": list_ops()
-}
+CAPABILITIES: Dict[str, Any] = {"ops": list_ops()}
+
+# ---------------- rate-limited logging ----------------
+
+_last_err: Dict[str, float] = {}
+
+
+def _log_err_ratelimited(key: str, msg: str) -> None:
+    now = time.time()
+    last = _last_err.get(key, 0.0)
+    if now - last >= ERROR_LOG_EVERY_SEC:
+        print(msg, flush=True)
+        _last_err[key] = now
+
 
 # ---------------- metrics helpers ----------------
 
 
 def _record_task_result(duration_ms: float, ok: bool) -> None:
-    """
-    Record the result of a task execution for local metrics tracking.
-    Thread-safe.
-    """
     global _tasks_completed, _tasks_failed, _task_durations
-
     with _metrics_lock:
         if ok:
             _tasks_completed += 1
@@ -77,63 +90,62 @@ def _record_task_result(duration_ms: float, ok: bool) -> None:
             _tasks_failed += 1
 
         _task_durations.append(duration_ms)
-        # Keep only the last N samples for rolling average
         if len(_task_durations) > _max_duration_samples:
             _task_durations.pop(0)
 
 
 def _collect_metrics() -> Dict[str, Any]:
-    """
-    Collect lightweight agent metrics for autonomic decisions.
-    Includes both system metrics (CPU, RAM) and task performance metrics.
-    """
     metrics: Dict[str, Any] = {}
 
-    # System metrics via psutil
     if psutil is not None:
         try:
             metrics["cpu_util"] = psutil.cpu_percent(interval=0.0) / 100.0
         except Exception:
             pass
-
         try:
             vm = psutil.virtual_memory()
             metrics["ram_mb"] = int(vm.used / (1024 * 1024))
         except Exception:
             pass
 
-    # Task performance metrics
     with _metrics_lock:
         metrics["tasks_completed"] = _tasks_completed
         metrics["tasks_failed"] = _tasks_failed
-
         if _task_durations:
-            avg_ms = sum(_task_durations) / len(_task_durations)
-            metrics["avg_task_ms"] = avg_ms
+            metrics["avg_task_ms"] = sum(_task_durations) / len(_task_durations)
 
     return metrics
 
 
 # ---------------- HTTP helpers ----------------
 
+_session = requests.Session()
+
+
+def _url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CONTROLLER_URL}{path}"
+
 
 def _post_json(path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    url = f"{CONTROLLER_URL}{path}"
+    url = _url(path)
     try:
-        resp = requests.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
+        resp = _session.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
         resp.raise_for_status()
         if resp.content:
             return resp.json()
         return None
     except Exception as e:
-        print(f"[agent] POST {url} failed: {e}")
+        _log_err_ratelimited("post:" + path, f"[agent] POST {url} failed: {e}")
+        time.sleep(ERROR_BACKOFF_SEC)
         return None
 
 
 def _get_json(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    url = f"{CONTROLLER_URL}{path}"
+    url = _url(path)
     try:
-        resp = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
+        resp = _session.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
         if resp.status_code == 204:
             return None
         resp.raise_for_status()
@@ -141,37 +153,34 @@ def _get_json(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return resp.json()
         return None
     except Exception as e:
-        print(f"[agent] GET {url} failed: {e}")
+        _log_err_ratelimited("get:" + path, f"[agent] GET {url} failed: {e}")
+        time.sleep(ERROR_BACKOFF_SEC)
         return None
 
 
 # ---------------- register / heartbeat ----------------
 
 
-def register_agent() -> None:
-    payload: Dict[str, Any] = {
+def _agent_envelope() -> Dict[str, Any]:
+    # Note: WORKER_PROFILE is computed once at startup (good enough for now).
+    # If you ever hot-plug GPUs, we can recompute periodically.
+    return {
         "agent": AGENT_NAME,
         "labels": BASE_LABELS,
         "capabilities": CAPABILITIES,
         "worker_profile": WORKER_PROFILE,
+        "metrics": _collect_metrics(),
     }
-    # send metrics as a dedicated sub-dict
-    payload["metrics"] = _collect_metrics()
-    print(f"[agent] registering with controller as {AGENT_NAME}")
-    _post_json("/agents/register", payload)
+
+
+def register_agent() -> None:
+    print(f"[agent] registering with controller as {AGENT_NAME}", flush=True)
+    _post_json("/agents/register", _agent_envelope())
 
 
 def heartbeat_loop() -> None:
     while _running:
-        payload: Dict[str, Any] = {
-            "agent": AGENT_NAME,
-            "labels": BASE_LABELS,
-            "capabilities": CAPABILITIES,
-            "worker_profile": WORKER_PROFILE,
-        }
-        # send metrics as a dedicated sub-dict
-        payload["metrics"] = _collect_metrics()
-        _post_json("/agents/heartbeat", payload)
+        _post_json("/agents/heartbeat", _agent_envelope())
         time.sleep(HEARTBEAT_SEC)
 
 
@@ -180,55 +189,69 @@ def heartbeat_loop() -> None:
 
 def _execute_op(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generic dispatcher using the ops plugin registry.
-
     Contract with ops handlers:
       - handler(payload: Dict[str, Any]) -> Dict[str, Any]
-      - returned dict SHOULD include "ok": bool
-        - if missing, we assume ok=True
+      - returned dict SHOULD include "ok": bool (missing => assume ok=True)
       - may include "error": str on failure
     """
-    fn = get_op(op)
+    try:
+        fn = get_op(op)
+    except Exception:
+        fn = None
+
     if fn is None:
-        return {
-            "ok": False,
-            "error": f"Unknown op '{op}'",
-        }
+        return {"ok": False, "error": f"Unknown op '{op}'"}
 
     try:
         result = fn(payload)
-        # Normalize in case handler forgot "ok"
         if not isinstance(result, dict):
-            # wrap non-dict results
-            return {
-                "ok": True,
-                "value": result,
-            }
-
+            return {"ok": True, "value": result}
         if "ok" not in result:
             result = {**result, "ok": True}
-
         return result
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"Exception in op '{op}': {e}",
-        }
+        return {"ok": False, "error": f"Exception in op '{op}': {e}"}
+
+
+def _validate_task(task: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    job_id = task.get("id")
+    op = task.get("op")
+    payload = task.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    if not isinstance(job_id, str) or not job_id:
+        return None, op if isinstance(op, str) else None, payload
+    if not isinstance(op, str) or not op:
+        return job_id, None, payload
+    return job_id, op, payload
 
 
 def worker_loop() -> None:
-    global _running
-    print(f"[agent] worker loop starting for {AGENT_NAME}")
+    print(f"[agent] worker loop starting for {AGENT_NAME}", flush=True)
     while _running:
-        # Ask for a task
         task = _get_json("/task", {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS})
         if not task:
-            # No task right now
             continue
 
-        job_id = task.get("id")
-        op = task.get("op")
-        payload = task.get("payload") or {}
+        if not isinstance(task, dict):
+            _log_err_ratelimited("task:shape", f"[agent] invalid task shape: {type(task)}")
+            continue
+
+        job_id, op, payload = _validate_task(task)
+
+        # If controller gives us a broken task, report it back (if we can).
+        if not job_id or not op:
+            result_payload: Dict[str, Any] = {
+                "id": job_id or "unknown",
+                "agent": AGENT_NAME,
+                "op": op or "unknown",
+                "ok": False,
+                "result": None,
+                "error": "Invalid task: missing id/op",
+                "duration_ms": 0.0,
+            }
+            _post_json("/result", result_payload)
+            continue
 
         start_ts = time.time()
         result_data = _execute_op(op, payload)
@@ -237,10 +260,9 @@ def worker_loop() -> None:
         ok = bool(result_data.get("ok", True))
         error_str = result_data.get("error")
 
-        # Record metrics locally
         _record_task_result(duration_ms, ok)
 
-        result_payload: Dict[str, Any] = {
+        result_payload = {
             "id": job_id,
             "agent": AGENT_NAME,
             "op": op,
@@ -249,7 +271,6 @@ def worker_loop() -> None:
             "error": error_str if not ok else None,
             "duration_ms": duration_ms,
         }
-
         _post_json("/result", result_payload)
 
 
@@ -258,7 +279,7 @@ def worker_loop() -> None:
 
 def _stop(*_args, **_kwargs):
     global _running
-    print("[agent] stop signal received, shutting down...")
+    print("[agent] stop signal received, shutting down...", flush=True)
     _running = False
 
 

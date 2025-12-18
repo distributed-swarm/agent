@@ -7,12 +7,10 @@ import time
 from typing import Any, Dict, List
 
 # IMPORTANT:
-# Do NOT do: from . import register_op
-# That can create a circular import if ops/__init__.py imports this module.
-#
-# Import register_op directly from the module where it is defined.
-# If your project defines register_op somewhere else, adjust this import.
-from .registry import register_op  # <-- change ONLY if your register_op lives elsewhere
+# In THIS codebase, register_op is defined in ops/__init__.py.
+# Importing it via "from . import register_op" is safe because ops/__init__.py
+# defines register_op BEFORE it imports any op modules (including this one).
+from . import register_op
 
 try:
     from PIL import Image  # type: ignore

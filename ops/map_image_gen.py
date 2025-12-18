@@ -4,9 +4,15 @@ from __future__ import annotations
 import base64
 import io
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from . import register_op
+# IMPORTANT:
+# Do NOT do: from . import register_op
+# That can create a circular import if ops/__init__.py imports this module.
+#
+# Import register_op directly from the module where it is defined.
+# If your project defines register_op somewhere else, adjust this import.
+from .registry import register_op  # <-- change ONLY if your register_op lives elsewhere
 
 try:
     from PIL import Image  # type: ignore
@@ -36,7 +42,6 @@ def _fake_image_bytes(prompt: str, size: str) -> bytes:
         pass
 
     img = Image.new("RGB", (w, h), (255, 255, 255))
-    # keep it simple; no text rendering dependency
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -58,8 +63,8 @@ def map_image_gen(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Image generation mapping op.
 
-    NOTE: This file ships with a placeholder generator to keep the op usable
-    immediately. Swap _fake_image_bytes() with your actual image backend.
+    Placeholder backend: returns a valid PNG in base64.
+    Swap _fake_image_bytes() with a real generator later.
 
     payload:
       - prompt: str (single)
@@ -73,19 +78,24 @@ def map_image_gen(payload: Dict[str, Any]) -> Dict[str, Any]:
     size = str(payload.get("size", "256x256"))
     n = payload.get("n", 1)
 
+    # Batch mode
     if "items" in payload:
         items = payload.get("items")
         if not isinstance(items, list):
             raise ValueError("payload.items must be a list")
+
         out: List[Dict[str, Any]] = []
         for it in items:
             if not isinstance(it, dict):
                 raise ValueError("payload.items elements must be dicts")
+
             prompt = it.get("prompt")
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("each item must include non-empty prompt")
+
             it_size = str(it.get("size", size))
             out.append(_one(prompt, it_size))
+
         return {
             "count": len(out),
             "items": out,
@@ -93,6 +103,7 @@ def map_image_gen(payload: Dict[str, Any]) -> Dict[str, Any]:
             "note": "placeholder generator; replace backend when ready",
         }
 
+    # Single mode
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("payload.prompt must be a non-empty string")

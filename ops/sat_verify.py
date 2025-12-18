@@ -1,6 +1,9 @@
+# ops/sat_verify.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
+
+from . import register_op
 
 
 def _lit_value(lit: int, bits: str) -> bool:
@@ -9,12 +12,13 @@ def _lit_value(lit: int, bits: str) -> bool:
     if v <= 0:
         return False
     if v > len(bits):
-        # If assignment doesn't cover this variable, treat as False (or raise).
+        # If assignment doesn't cover this variable, treat as False
         return False
     var_true = (bits[v - 1] == "1")
     return var_true if lit > 0 else (not var_true)
 
 
+@register_op("sat_verify")
 def sat_verify(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Verify CNF satisfaction for a proposed assignment.

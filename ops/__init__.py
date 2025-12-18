@@ -63,6 +63,12 @@ from . import map_classify    # noqa: F401
 from . import risk_accumulate # noqa: F401
 from . import sat_verify      # noqa: F401
 
+# Added ops
+from . import fibonacci       # noqa: F401
+from . import prime_factor    # noqa: F401
+from . import subset_sum      # noqa: F401
+from . import map_image_gen   # noqa: F401
+
 # If you later add truly optional ops, do it like this:
 # try:
 #     from . import some_optional_op  # noqa: F401

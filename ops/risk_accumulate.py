@@ -1,77 +1,77 @@
-import math
+# ops/risk_accumulate.py
+from __future__ import annotations
+
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List
 
-# In-memory state: per entity
-_STATE: Dict[str, Dict[str, float]] = {}
+from . import register_op
 
-def _exp_decay(dt: float, tau: float) -> float:
-    if tau <= 0:
-        return 0.0
-    return math.exp(-dt / tau)
 
-def run(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _to_float(x: Any) -> float:
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        return float(x.strip())
+    raise ValueError("value must be numeric")
+
+
+@register_op("risk_accumulate")
+def risk_accumulate(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    payload:
-      {
-        "now_ts": 1765997000.0,   # optional; default=time.time()
-        "tau_sec": 3600.0,
-        "weights": {"food": 1.0, "air": 0.3, "contact": 0.6},
-        "thresholds": {"warn": 10.0, "act": 20.0},
-        "events": [
-          {"entity_id":"jack", "mode":"air", "dose": 0.8, "ts": 1765996990.0},
-          ...
-        ]
-      }
+    Accumulate risk metrics.
+
+    Expected payload shapes:
+      A) {"values":[...]} where values are numeric
+      B) {"items":[{"risk":...}, ...], "field":"risk"} (field optional, defaults 'risk')
+
+    Returns:
+      - count, sum, mean, min, max
     """
-    now_ts = float(payload.get("now_ts") or time.time())
-    tau = float(payload.get("tau_sec", 3600.0))
-    weights = payload.get("weights") or {}
-    thr = payload.get("thresholds") or {"warn": 10.0, "act": 20.0}
-    events: List[Dict[str, Any]] = payload.get("events") or []
+    start = time.time()
 
-    # Group events per entity; sum dose per mode
-    grouped: Dict[str, Dict[str, float]] = {}
-    latest_ts: Dict[str, float] = {}
+    values: List[float] = []
 
-    for e in events:
-        ent = str(e["entity_id"])
-        mode = str(e.get("mode", "unknown"))
-        dose = float(e.get("dose", 0.0))
-        ts = float(e.get("ts", now_ts))
+    if "values" in payload:
+        raw = payload.get("values")
+        if not isinstance(raw, list):
+            raise ValueError("payload.values must be a list")
+        values = [_to_float(v) for v in raw]
 
-        grouped.setdefault(ent, {})
-        grouped[ent][mode] = grouped[ent].get(mode, 0.0) + dose
-        latest_ts[ent] = max(latest_ts.get(ent, 0.0), ts)
+    elif "items" in payload:
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise ValueError("payload.items must be a list")
+        field = payload.get("field", "risk")
+        for it in items:
+            if not isinstance(it, dict):
+                raise ValueError("payload.items must contain dict objects")
+            if field not in it:
+                continue
+            values.append(_to_float(it[field]))
 
-    results = []
-    for ent, doses_by_mode in grouped.items():
-        st = _STATE.get(ent) or {"B": 0.0, "last_ts": latest_ts.get(ent, now_ts)}
-        last_ts = float(st.get("last_ts", now_ts))
-        dt = max(0.0, now_ts - last_ts)
+    else:
+        raise ValueError("payload must include either 'values' or 'items'")
 
-        B = float(st.get("B", 0.0))
-        B *= _exp_decay(dt, tau)
+    if not values:
+        return {
+            "count": 0,
+            "sum": 0.0,
+            "mean": 0.0,
+            "min": None,
+            "max": None,
+            "compute_time_ms": (time.time() - start) * 1000.0,
+        }
 
-        # Add new doses
-        for mode, dose in doses_by_mode.items():
-            w = float(weights.get(mode, 0.0))
-            B += w * dose
+    total = sum(values)
+    mn = min(values)
+    mx = max(values)
+    mean = total / len(values)
 
-        # Save state
-        _STATE[ent] = {"B": B, "last_ts": now_ts}
-
-        # Flags
-        warn = B >= float(thr.get("warn", 10.0))
-        act = B >= float(thr.get("act", 20.0))
-
-        results.append({
-            "entity_id": ent,
-            "B": B,
-            "warn": warn,
-            "act": act,
-            "now_ts": now_ts,
-            "dt": dt,
-        })
-
-    return {"ok": True, "results": results}
+    return {
+        "count": len(values),
+        "sum": total,
+        "mean": mean,
+        "min": mn,
+        "max": mx,
+        "compute_time_ms": (time.time() - start) * 1000.0,
+    }

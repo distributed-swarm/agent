@@ -1,24 +1,27 @@
 # ops/__init__.py
 from __future__ import annotations
 
-from typing import Callable, Dict, Any, Optional
+from typing import Any, Callable, Dict, Optional, List, Tuple
+import importlib
 
 # Global registry of ops
 OPS_REGISTRY: Dict[str, Callable[..., Any]] = {}
+
+# Track import/load errors so CI doesn't explode on a single bad op
+OPS_LOAD_ERRORS: List[Tuple[str, str]] = []  # (module, error_string)
 
 
 def register_op(name: str):
     """
     Decorator to register an op handler function.
 
-    New-logic expectation:
+    Expectations:
       - ops should be importable (so decorators run)
       - op names should be unique
     """
     def decorator(fn: Callable[..., Any]):
         prev = OPS_REGISTRY.get(name)
         if prev is not None and prev is not fn:
-            # Keep last one (explicit override), but make it obvious in logs.
             try:
                 prev_name = getattr(prev, "__name__", str(prev))
                 fn_name = getattr(fn, "__name__", str(fn))
@@ -44,33 +47,55 @@ def get_op(name: str) -> Callable[..., Any]:
     """
     fn = OPS_REGISTRY.get(name)
     if fn is None:
+        # Include load errors to make debugging obvious at runtime
+        if OPS_LOAD_ERRORS:
+            errs = "; ".join([f"{m} => {e}" for (m, e) in OPS_LOAD_ERRORS[:10]])
+            more = "" if len(OPS_LOAD_ERRORS) <= 10 else f" (+{len(OPS_LOAD_ERRORS)-10} more)"
+            raise ValueError(
+                f"Unknown op {name!r}. Registered ops: {list_ops()}. "
+                f"Also saw op import errors: {errs}{more}"
+            )
         raise ValueError(f"Unknown op {name!r}. Registered ops: {list_ops()}")
     return fn
 
 
 def try_get_op(name: str) -> Optional[Callable[..., Any]]:
-    """New helper: return op or None (no exception)."""
+    """Helper: return op or None (no exception)."""
     return OPS_REGISTRY.get(name)
 
 
+def _import_op_module(mod: str) -> None:
+    """
+    Import ops.<mod> so its @register_op decorators run.
+    Never raise on failure — record and continue so 'import ops' still works.
+    """
+    try:
+        importlib.import_module(f"{__name__}.{mod}")
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        OPS_LOAD_ERRORS.append((mod, msg))
+        print(f"[ops] ERROR: failed to import ops.{mod}: {msg}", flush=True)
+
+
 # Import op modules so their @register_op decorators run.
-# Core ops (should always exist in the image)
-from . import echo            # noqa: F401
-from . import map_tokenize    # noqa: F401
-from . import map_summarize   # noqa: F401
-from . import csv_shard       # noqa: F401
-from . import map_classify    # noqa: F401
-from . import risk_accumulate # noqa: F401
-from . import sat_verify      # noqa: F401
+# NOTE: this list should match actual filenames in ops/.
+# If you rename a module, update this list.
+_OP_MODULES = [
+    # Core ops
+    "echo",
+    "map_tokenize",
+    "map_summarize",
+    "csv_shard",
+    "map_classify",
+    "risk_accumulate",
+    "sat_verify",
 
-# Added ops
-from . import fibonacci       # noqa: F401
-from . import prime_factor    # noqa: F401
-from . import subset_sum      # noqa: F401
-from . import map_image_gen   # noqa: F401
+    # Added ops
+    "fibonacci",
+    "prime_factor",
+    "subset_sum",
+    "map_image_gen",
+]
 
-# If you later add truly optional ops, do it like this:
-# try:
-#     from . import some_optional_op  # noqa: F401
-# except Exception as e:
-#     print(f"[ops] optional op some_optional_op not loaded: {type(e).__name__}: {e}", flush=True)
+for _m in _OP_MODULES:
+    _import_op_module(_m)

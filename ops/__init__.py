@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional, List, Tuple
 import importlib
+import traceback
 
 # Global registry of ops
 OPS_REGISTRY: Dict[str, Callable[..., Any]] = {}
@@ -27,7 +28,10 @@ def register_op(name: str):
                 fn_name = getattr(fn, "__name__", str(fn))
             except Exception:
                 prev_name, fn_name = "<?>", "<?>"
-            print(f"[ops] WARNING: op '{name}' re-registered ({prev_name} -> {fn_name})", flush=True)
+            print(
+                f"[ops] WARNING: op '{name}' re-registered ({prev_name} -> {fn_name})",
+                flush=True,
+            )
 
         OPS_REGISTRY[name] = fn
         return fn
@@ -35,7 +39,7 @@ def register_op(name: str):
     return decorator
 
 
-def list_ops():
+def list_ops() -> List[str]:
     """Return sorted list of registered op names."""
     return sorted(OPS_REGISTRY.keys())
 
@@ -67,14 +71,21 @@ def try_get_op(name: str) -> Optional[Callable[..., Any]]:
 def _import_op_module(mod: str) -> None:
     """
     Import ops.<mod> so its @register_op decorators run.
-    Never raise on failure — record and continue so 'import ops' still works.
+
+    Behavior:
+      - Logs each import attempt (so CI shows progress).
+      - On failure: records the error AND prints full traceback (so we can fix fast).
+      - Does NOT raise: keeps 'import ops' alive in runtime environments.
+        (If you want CI to hard-fail on first bad op, change the last line to: raise)
     """
     try:
+        print(f"[ops] importing ops.{mod}", flush=True)
         importlib.import_module(f"{__name__}.{mod}")
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         OPS_LOAD_ERRORS.append((mod, msg))
         print(f"[ops] ERROR: failed to import ops.{mod}: {msg}", flush=True)
+        traceback.print_exc()
 
 
 # Import op modules so their @register_op decorators run.

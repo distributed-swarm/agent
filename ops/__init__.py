@@ -61,6 +61,7 @@ from . import map_summarize   # noqa: F401
 from . import csv_shard       # noqa: F401
 from . import map_classify    # noqa: F401
 from . import risk_accumulate # noqa: F401
+from . import sat_verify      # noqa: F401
 
 # If you later add truly optional ops, do it like this:
 # try:

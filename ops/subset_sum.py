@@ -55,7 +55,7 @@ def subset_sum(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Subset Sum op.
     payload:
-      - nums: list[int]
+      - nums: list[int]   (or 'arr' as an alias)
       - target: int
 
     Returns:
@@ -63,6 +63,9 @@ def subset_sum(payload: Dict[str, Any]) -> Dict[str, Any]:
       - witness: list[int] (one solution subset, may be empty if unsolved)
     """
     nums = payload.get("nums")
+    if nums is None and "arr" in payload:
+        nums = payload.get("arr")
+
     target_raw = payload.get("target")
 
     if not isinstance(nums, list) or any(not isinstance(x, (int, float, str)) for x in nums):
@@ -101,9 +104,11 @@ def subset_sum(payload: Dict[str, Any]) -> Dict[str, Any]:
     out = _subset_sum_dp(nums_i, target)
     elapsed_ms = (time.time() - start) * 1000.0
 
-    out.update({
-        "target": target,
-        "n": len(nums_i),
-        "compute_time_ms": elapsed_ms,
-    })
+    out.update(
+        {
+            "target": target,
+            "n": len(nums_i),
+            "compute_time_ms": elapsed_ms,
+        }
+    )
     return out

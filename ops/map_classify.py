@@ -142,7 +142,9 @@ def map_classify_op(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pos_score, neg_score, scores = _get_pos_neg_scores(probs, _model.config.id2label)
 
-    label = _infer_label(pos_score=pos_score, score_neg=neg_score, pos_thresh=pos_thresh, neg_thresh=neg_thresh)
+    # FIX: _infer_label expects score_pos, not pos_score
+    label = _infer_label(score_pos=pos_score, score_neg=neg_score, pos_thresh=pos_thresh, neg_thresh=neg_thresh)
+
     # "score" = confidence of chosen label
     score = pos_score if label == "POSITIVE" else neg_score if label == "NEGATIVE" else max(pos_score, neg_score)
 

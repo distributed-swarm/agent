@@ -1,159 +1,186 @@
-# ops/map_classify.py
-import os
-import threading
-from typing import Any, Dict, List, Optional, Tuple
+# ops/wrapper.py
+from __future__ import annotations
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-from . import register_op
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-OP_NAME = "map_classify"
-
-# Model name (same default you used)
-HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "assemblyai/distilbert-base-uncased-sst2")
-
-# Thresholds (env configurable; safe defaults)
-# If score >= POS_THRESH -> POSITIVE
-# If score >= NEG_THRESH -> NEGATIVE
-# Else -> NEUTRAL
-_POS_THRESH = float(os.getenv("MAP_CLASSIFY_POS_THRESH", "0.60"))
-_NEG_THRESH = float(os.getenv("MAP_CLASSIFY_NEG_THRESH", "0.60"))
-
-# Optional: if you want to force CPU even when CUDA exists
-_FORCE_CPU = os.getenv("MAP_CLASSIFY_FORCE_CPU", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
-
-_model_lock = threading.Lock()
-_model: Optional[AutoModelForSequenceClassification] = None
-_tokenizer: Optional[AutoTokenizer] = None
-_model_device: str = "cpu"
+Json = Dict[str, Any]
+OpFn = Callable[[Dict[str, Any]], Dict[str, Any]]  # most ops accept dict payloads
 
 
-def _select_device() -> str:
-    if _FORCE_CPU:
-        return "cpu"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+@dataclass
+class OpError(Exception):
+    code: str
+    message: str
+    retryable: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"code": self.code, "message": self.message, "retryable": self.retryable}
 
 
-def _init_model() -> None:
+def _now_ms() -> float:
+    return time.time() * 1000.0
+
+
+def _coerce_payload(payload: Any) -> Any:
     """
-    Lazily load the HF sentiment model on CPU or GPU.
+    Normalize raw payload forms:
+      - None -> {}
+      - str/int/float/bool -> {"value": <scalar>}
+      - dict -> dict
+      - list -> list
     """
-    global _model, _tokenizer, _model_device
-    if _model is not None and _tokenizer is not None:
-        return
-
-    with _model_lock:
-        if _model is not None and _tokenizer is not None:
-            return
-
-        device = _select_device()
-        print(f"[map_classify] Loading HF model '{HF_MODEL_NAME}' on {device}", flush=True)
-
-        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
-        model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_NAME)
-        model.to(device)
-        model.eval()
-
-        _model = model
-        _tokenizer = tokenizer
-        _model_device = device
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, (str, int, float, bool)):
+        return {"value": payload}
+    # last resort: stringify (keeps wrapper from exploding)
+    return {"value": str(payload)}
 
 
-def _infer_label(score_pos: float, score_neg: float, pos_thresh: float, neg_thresh: float) -> str:
-    if score_pos >= pos_thresh:
-        return "POSITIVE"
-    if score_neg >= neg_thresh:
-        return "NEGATIVE"
-    return "NEUTRAL"
+def _is_map_op(op_name: str) -> bool:
+    return op_name.startswith("map_")
 
 
-def _get_pos_neg_scores(probs: torch.Tensor, id2label: Dict[int, str]) -> Tuple[float, float, List[float]]:
+def _normalize_map_input(payload: Any) -> Tuple[bool, List[Dict[str, Any]]]:
     """
-    Returns (pos_score, neg_score, scores_list) regardless of model label naming.
-    Assumes a 2-class classifier (SST2 style).
+    For map_* ops:
+      - Accept dict -> single item
+      - Accept list[dict|scalar] -> batch items (each coerced to dict)
+    Returns (is_batch, items_as_dicts)
     """
-    scores = probs.detach().cpu().tolist()
-    # Default mapping for SST2-style (0=NEGATIVE, 1=POSITIVE), but be defensive.
-    label0 = str(id2label.get(0, "0")).upper()
-    label1 = str(id2label.get(1, "1")).upper()
+    if isinstance(payload, list):
+        items: List[Dict[str, Any]] = []
+        for it in payload:
+            it2 = _coerce_payload(it)
+            if not isinstance(it2, dict):
+                # should never happen after _coerce_payload, but keep it tight
+                raise OpError("INVALID_ARGUMENT", "map input items must be object-like", retryable=False)
+            items.append(it2)
+        return True, items
 
-    # probs is shape [num_labels]
-    s0 = float(probs[0].item()) if probs.numel() > 0 else 0.0
-    s1 = float(probs[1].item()) if probs.numel() > 1 else 0.0
-
-    # Try to infer which is POS/NEG from id2label
-    if "POS" in label0 and "NEG" in label1:
-        pos, neg = s0, s1
-    elif "NEG" in label0 and "POS" in label1:
-        neg, pos = s0, s1
-    else:
-        # Fallback: assume index 1 is positive (SST2 convention)
-        neg, pos = s0, s1
-
-    return pos, neg, scores
+    payload2 = _coerce_payload(payload)
+    if not isinstance(payload2, dict):
+        raise OpError("INVALID_ARGUMENT", "payload must be an object", retryable=False)
+    return False, [payload2]
 
 
-@register_op(OP_NAME)
-def map_classify_op(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _wrap_success(result: Any, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "result": result, "metrics": metrics}
+
+
+def _wrap_error(err: OpError, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": False, "error": err.to_dict(), "metrics": metrics}
+
+
+def _classify_exception(e: Exception) -> OpError:
     """
-    Sentiment classification via HF SST2 model.
-
-    Payload supported:
-      - {"text": "..."}
-      - Optional overrides:
-          {"text": "...", "pos_thresh": 0.65, "neg_thresh": 0.65, "max_length": 256}
+    Map raw exceptions to stable error codes.
+    Tune this over time; keep it conservative.
     """
-    _init_model()
-    assert _model is not None
-    assert _tokenizer is not None
+    if isinstance(e, OpError):
+        return e
 
-    text = str(payload.get("text", "")).strip()
-    if not text:
-        return {
-            "ok": True,
-            "label": "NEUTRAL",
-            "score": 0.0,
-            "scores": [],
-            "device": _model_device,
-            "thresholds": {"pos": _POS_THRESH, "neg": _NEG_THRESH},
-            "model": HF_MODEL_NAME,
-        }
+    # Common “bad input” paths
+    if isinstance(e, (ValueError, TypeError)):
+        return OpError("INVALID_ARGUMENT", str(e) or "Invalid argument", retryable=False)
 
-    # Allow per-request override (optional)
-    pos_thresh = float(payload.get("pos_thresh", _POS_THRESH))
-    neg_thresh = float(payload.get("neg_thresh", _NEG_THRESH))
-    max_length = int(payload.get("max_length", 256))
+    # Torch/CUDA OOM often contains "out of memory"
+    msg = str(e) or e.__class__.__name__
+    if "out of memory" in msg.lower():
+        return OpError("OOM", msg, retryable=True)
 
-    inputs = _tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=max_length,
-    )
-    inputs = {k: v.to(_model_device) for k, v in inputs.items()}
+    return OpError("INTERNAL", msg, retryable=True)
 
-    with torch.no_grad():
-        outputs = _model(**inputs)
-        logits = outputs.logits
-        probs = torch.softmax(logits, dim=-1)[0]
 
-    pos_score, neg_score, scores = _get_pos_neg_scores(probs, _model.config.id2label)
+def _get_op_spec(op_fn: Callable[..., Any]) -> Dict[str, Any]:
+    """
+    Optional op metadata.
+    Convention: attach a dict to the function object:
+        op_fn.OP_SPEC = {"accepts_batch": True, "batch_key": "items", "result_key": "items"}
+    """
+    spec = getattr(op_fn, "OP_SPEC", None)
+    return spec if isinstance(spec, dict) else {}
 
-    # FIX: _infer_label expects score_pos, not pos_score
-    label = _infer_label(score_pos=pos_score, score_neg=neg_score, pos_thresh=pos_thresh, neg_thresh=neg_thresh)
 
-    # "score" = confidence of chosen label
-    score = pos_score if label == "POSITIVE" else neg_score if label == "NEGATIVE" else max(pos_score, neg_score)
+def run_op(
+    op_name: str,
+    op_fn: Callable[[Dict[str, Any]], Dict[str, Any]],
+    payload: Any,
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Execute an op under a strict envelope.
 
-    return {
-        "ok": True,
-        "label": label,
-        "score": float(score),
-        "scores": scores,  # raw softmax probs (model order)
-        "device": _model_device,
-        "thresholds": {"pos": float(pos_thresh), "neg": float(neg_thresh)},
-        "model": HF_MODEL_NAME,
+    - For non-map ops: passes a dict payload to op_fn and returns op output under result.
+    - For map_* ops:
+        * Accepts dict OR list input.
+        * If op advertises OP_SPEC.accepts_batch and input is a list, passes the whole batch
+          in a single call (GPU-friendly).
+        * Otherwise falls back to scalar-per-item execution (correct, slower).
+    """
+    t0 = _now_ms()
+    meta = meta or {}
+
+    metrics: Dict[str, Any] = {
+        "op": op_name,
+        "started_ms": t0,
+        "meta": meta,
     }
+
+    try:
+        p = _coerce_payload(payload)
+
+        if _is_map_op(op_name):
+            is_batch, items = _normalize_map_input(p)
+
+            spec = _get_op_spec(op_fn)
+            accepts_batch = bool(spec.get("accepts_batch"))
+            batch_key = spec.get("batch_key", "items")
+            result_key = spec.get("result_key", "items")
+
+            # Fast path: pass batch through in one call (op handles true batching)
+            if is_batch and accepts_batch:
+                raw = op_fn({batch_key: items})
+
+                # If op returns {"items": [...]}, unwrap that to keep outer contract stable
+                if isinstance(raw, dict) and result_key in raw and isinstance(raw[result_key], list):
+                    result = raw[result_key]
+                else:
+                    result = raw
+
+                metrics["duration_ms"] = _now_ms() - t0
+                metrics["batched"] = True
+                metrics["batch_size"] = len(items)
+                return _wrap_success(result=result, metrics=metrics)
+
+            # Fallback: scalar-per-item (correct, slower)
+            out_items: List[Any] = []
+            for item in items:
+                out_items.append(op_fn(item))
+
+            metrics["duration_ms"] = _now_ms() - t0
+            metrics["batched"] = False
+            metrics["batch_size"] = len(items)
+            result = out_items if is_batch else out_items[0]
+            return _wrap_success(result=result, metrics=metrics)
+
+        # non-map op: single dict payload
+        if not isinstance(p, dict):
+            raise OpError("INVALID_ARGUMENT", "payload must be an object", retryable=False)
+
+        raw = op_fn(p)
+        metrics["duration_ms"] = _now_ms() - t0
+        return _wrap_success(result=raw, metrics=metrics)
+
+    except Exception as e:
+        err = _classify_exception(e)
+        metrics["duration_ms"] = _now_ms() - t0
+        return _wrap_error(err=err, metrics=metrics)

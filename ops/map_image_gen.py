@@ -1,21 +1,43 @@
-# ops/map_image_gen.py
 from __future__ import annotations
 
 import base64
 import io
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
-# IMPORTANT:
-# In THIS codebase, register_op is defined in ops/__init__.py.
-# Importing it via "from . import register_op" is safe because ops/__init__.py
-# defines register_op BEFORE it imports any op modules (including this one).
 from . import register_op
 
 try:
     from PIL import Image  # type: ignore
 except Exception:
     Image = None  # pillow optional
+
+# Import OpError from wrapper so we can return stable error codes.
+# This is safe because wrapper.py does not import ops modules.
+from .wrapper import OpError  # type: ignore
+
+
+_BACKEND = "placeholder_fake_png"
+
+
+def _parse_size(size: str) -> Tuple[int, int]:
+    """
+    Parse WxH like '256x256'. Clamp to sane bounds.
+    """
+    w, h = 256, 256
+    s = (size or "").strip().lower()
+    if "x" in s:
+        a, b = s.split("x", 1)
+        try:
+            w = int(a)
+            h = int(b)
+        except Exception:
+            raise OpError("INVALID_ARGUMENT", "size must be like '256x256'", retryable=False)
+
+    # Clamp to keep placeholder safe
+    w = max(1, min(2048, w))
+    h = max(1, min(2048, h))
+    return w, h
 
 
 def _fake_image_bytes(prompt: str, size: str) -> bytes:
@@ -30,15 +52,8 @@ def _fake_image_bytes(prompt: str, size: str) -> bytes:
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
         )
 
-    w, h = 256, 256
-    try:
-        if "x" in size:
-            a, b = size.lower().split("x", 1)
-            w = max(1, min(2048, int(a)))
-            h = max(1, min(2048, int(b)))
-    except Exception:
-        pass
-
+    w, h = _parse_size(size)
+    # Note: we ignore prompt in placeholder mode, but keep it in outputs for contract stability
     img = Image.new("RGB", (w, h), (255, 255, 255))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -56,6 +71,19 @@ def _one(prompt: str, size: str) -> Dict[str, Any]:
     }
 
 
+def _require_nonempty_str(val: Any, field: str) -> str:
+    if not isinstance(val, str) or not val.strip():
+        raise OpError("INVALID_ARGUMENT", f"{field} must be a non-empty string", retryable=False)
+    return val.strip()
+
+
+def _require_int(val: Any, field: str) -> int:
+    try:
+        return int(val)
+    except Exception:
+        raise OpError("INVALID_ARGUMENT", f"{field} must be an int", retryable=False)
+
+
 @register_op("map_image_gen")
 def map_image_gen(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -64,60 +92,95 @@ def map_image_gen(payload: Dict[str, Any]) -> Dict[str, Any]:
     Placeholder backend: returns a valid PNG in base64.
     Swap _fake_image_bytes() with a real generator later.
 
-    payload:
-      - prompt: str (single)
-      - n: int (optional, default 1)
-      - size: str (optional, default '256x256')
-    OR
-      - items: list[{"prompt": str, "size": str?}] (batch)
+    Supported payloads:
+
+    Single:
+      {
+        "prompt": "a cat",
+        "n": 1,                 # optional, default 1, [1..8]
+        "size": "256x256"       # optional, default "256x256"
+      }
+
+    Batch:
+      {
+        "items": [
+          {"prompt":"a cat", "size":"256x256"},
+          {"prompt":"a dog"}              # size inherited from top-level size/default
+        ],
+        "size":"256x256"                 # optional default for items
+      }
+
+    Returns (op-level envelope):
+      {
+        "ok": true,
+        "result": {"count": N, "items": [...], "note": "..."},
+        "metrics": {"compute_time_ms": ..., "backend": "..."}
+      }
     """
     start = time.time()
 
-    size = str(payload.get("size", "256x256"))
-    n = payload.get("n", 1)
+    if not isinstance(payload, dict):
+        raise OpError("INVALID_ARGUMENT", "payload must be an object", retryable=False)
+
+    default_size = str(payload.get("size", "256x256")).strip() or "256x256"
 
     # Batch mode
     if "items" in payload:
         items = payload.get("items")
         if not isinstance(items, list):
-            raise ValueError("payload.items must be a list")
+            raise OpError("INVALID_ARGUMENT", "payload.items must be a list", retryable=False)
 
         out: List[Dict[str, Any]] = []
-        for it in items:
+        for idx, it in enumerate(items):
             if not isinstance(it, dict):
-                raise ValueError("payload.items elements must be dicts")
+                raise OpError("INVALID_ARGUMENT", f"payload.items[{idx}] must be an object", retryable=False)
 
-            prompt = it.get("prompt")
-            if not isinstance(prompt, str) or not prompt.strip():
-                raise ValueError("each item must include non-empty prompt")
+            prompt = _require_nonempty_str(it.get("prompt"), f"payload.items[{idx}].prompt")
+            it_size = str(it.get("size", default_size)).strip() or default_size
 
-            it_size = str(it.get("size", size))
             out.append(_one(prompt, it_size))
 
+        compute_ms = (time.time() - start) * 1000.0
         return {
-            "count": len(out),
-            "items": out,
-            "compute_time_ms": (time.time() - start) * 1000.0,
-            "note": "placeholder generator; replace backend when ready",
+            "ok": True,
+            "result": {
+                "count": len(out),
+                "items": out,
+                "note": "placeholder generator; replace backend when ready",
+            },
+            "metrics": {
+                "compute_time_ms": compute_ms,
+                "backend": _BACKEND,
+                "batched": True,
+                "batch_size": len(out),
+            },
         }
 
     # Single mode
-    prompt = payload.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("payload.prompt must be a non-empty string")
+    prompt = _require_nonempty_str(payload.get("prompt"), "payload.prompt")
 
-    try:
-        n_int = int(n)
-    except Exception:
-        raise ValueError("payload.n must be an int")
-
+    n_int = _require_int(payload.get("n", 1), "payload.n")
     if n_int < 1 or n_int > 8:
-        raise ValueError("payload.n must be between 1 and 8")
+        raise OpError("INVALID_ARGUMENT", "payload.n must be between 1 and 8", retryable=False)
 
-    out = [_one(prompt, size) for _ in range(n_int)]
+    out = [_one(prompt, default_size) for _ in range(n_int)]
+    compute_ms = (time.time() - start) * 1000.0
     return {
-        "count": len(out),
-        "items": out,
-        "compute_time_ms": (time.time() - start) * 1000.0,
-        "note": "placeholder generator; replace backend when ready",
+        "ok": True,
+        "result": {
+            "count": len(out),
+            "items": out,
+            "note": "placeholder generator; replace backend when ready",
+        },
+        "metrics": {
+            "compute_time_ms": compute_ms,
+            "backend": _BACKEND,
+            "batched": False,
+            "batch_size": len(out),
+        },
     }
+
+
+# Tell the wrapper we support batch payloads in one call.
+# Even though placeholder mode doesn't speed up, the contract is correct and future-proof.
+map_image_gen.OP_SPEC = {"accepts_batch": True, "batch_key": "items", "result_key": "items"}

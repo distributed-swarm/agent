@@ -2,20 +2,15 @@ from __future__ import annotations
 
 import base64
 import io
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from . import register_op
+from .wrapper import OpError  # structured errors -> wrapper produces envelope
 
 try:
     from PIL import Image  # type: ignore
 except Exception:
     Image = None  # pillow optional
-
-# Import OpError from wrapper so we can return stable error codes.
-# This is safe because wrapper.py does not import ops modules.
-from .wrapper import OpError  # type: ignore
-
 
 _BACKEND = "placeholder_fake_png"
 
@@ -34,7 +29,6 @@ def _parse_size(size: str) -> Tuple[int, int]:
         except Exception:
             raise OpError("INVALID_ARGUMENT", "size must be like '256x256'", retryable=False)
 
-    # Clamp to keep placeholder safe
     w = max(1, min(2048, w))
     h = max(1, min(2048, h))
     return w, h
@@ -43,7 +37,7 @@ def _parse_size(size: str) -> Tuple[int, int]:
 def _fake_image_bytes(prompt: str, size: str) -> bytes:
     """
     Placeholder generator for environments without a real image model.
-    Produces a tiny PNG with deterministic content.
+    Produces a valid PNG.
     Replace later with your actual backend.
     """
     if Image is None:
@@ -53,22 +47,16 @@ def _fake_image_bytes(prompt: str, size: str) -> bytes:
         )
 
     w, h = _parse_size(size)
-    # Note: we ignore prompt in placeholder mode, but keep it in outputs for contract stability
     img = Image.new("RGB", (w, h), (255, 255, 255))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _one(prompt: str, size: str) -> Dict[str, Any]:
-    png = _fake_image_bytes(prompt, size)
-    b64 = base64.b64encode(png).decode("ascii")
-    return {
-        "prompt": prompt,
-        "size": size,
-        "image_base64_png": b64,
-        "bytes": len(png),
-    }
+def _require_dict(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise OpError("INVALID_ARGUMENT", "payload must be an object", retryable=False)
+    return payload
 
 
 def _require_nonempty_str(val: Any, field: str) -> str:
@@ -84,103 +72,103 @@ def _require_int(val: Any, field: str) -> int:
         raise OpError("INVALID_ARGUMENT", f"{field} must be an int", retryable=False)
 
 
+def _one_image_raw(prompt: str, size: str) -> Dict[str, Any]:
+    png = _fake_image_bytes(prompt, size)
+    b64 = base64.b64encode(png).decode("ascii")
+    return {
+        "prompt": prompt,
+        "size": size,
+        "mime": "image/png",
+        "image_base64": b64,
+        "bytes": len(png),
+        "backend": _BACKEND,
+    }
+
+
 @register_op("map_image_gen")
 def map_image_gen(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Image generation mapping op.
+    RAW-only op.
 
-    Placeholder backend: returns a valid PNG in base64.
-    Swap _fake_image_bytes() with a real generator later.
+    Semantics:
+      - Scalar payload generates N images for a single prompt.
+      - Batched payload maps each item -> (possibly N images) for that item.
 
-    Supported payloads:
-
-    Single:
+    Scalar payload:
       {
         "prompt": "a cat",
         "n": 1,                 # optional, default 1, [1..8]
         "size": "256x256"       # optional, default "256x256"
       }
 
-    Batch:
+    Returns RAW dict:
+      {
+        "count": N,
+        "items": [ {image...}, ... ],
+        "note": "..."
+      }
+
+    Batch payload:
       {
         "items": [
-          {"prompt":"a cat", "size":"256x256"},
-          {"prompt":"a dog"}              # size inherited from top-level size/default
+          {"prompt":"a cat", "n": 1, "size":"256x256"},
+          {"prompt":"a dog"}              # size inherited from top-level/default
         ],
         "size":"256x256"                 # optional default for items
       }
 
-    Returns (op-level envelope):
-      {
-        "ok": true,
-        "result": {"count": N, "items": [...], "note": "..."},
-        "metrics": {"compute_time_ms": ..., "backend": "..."}
-      }
+    Returns RAW dict:
+      {"items": [ <RAW scalar dict>, <RAW scalar dict>, ... ]}
+      (wrapper unwraps to list result)
     """
-    start = time.time()
-
-    if not isinstance(payload, dict):
-        raise OpError("INVALID_ARGUMENT", "payload must be an object", retryable=False)
+    payload = _require_dict(payload)
 
     default_size = str(payload.get("size", "256x256")).strip() or "256x256"
 
-    # Batch mode
-    if "items" in payload:
-        items = payload.get("items")
-        if not isinstance(items, list):
-            raise OpError("INVALID_ARGUMENT", "payload.items must be a list", retryable=False)
+    # Batch mode: items -> list of RAW scalar outputs
+    if isinstance(payload.get("items"), list):
+        items = payload["items"]
+        out_list: List[Dict[str, Any]] = []
 
-        out: List[Dict[str, Any]] = []
         for idx, it in enumerate(items):
             if not isinstance(it, dict):
                 raise OpError("INVALID_ARGUMENT", f"payload.items[{idx}] must be an object", retryable=False)
 
             prompt = _require_nonempty_str(it.get("prompt"), f"payload.items[{idx}].prompt")
-            it_size = str(it.get("size", default_size)).strip() or default_size
+            size = str(it.get("size", default_size)).strip() or default_size
 
-            out.append(_one(prompt, it_size))
+            n = _require_int(it.get("n", 1), f"payload.items[{idx}].n")
+            if n < 1 or n > 8:
+                raise OpError(
+                    "INVALID_ARGUMENT",
+                    f"payload.items[{idx}].n must be between 1 and 8",
+                    retryable=False,
+                )
 
-        compute_ms = (time.time() - start) * 1000.0
-        return {
-            "ok": True,
-            "result": {
-                "count": len(out),
-                "items": out,
-                "note": "placeholder generator; replace backend when ready",
-            },
-            "metrics": {
-                "compute_time_ms": compute_ms,
-                "backend": _BACKEND,
-                "batched": True,
-                "batch_size": len(out),
-            },
-        }
+            imgs = [_one_image_raw(prompt, size) for _ in range(n)]
+            out_list.append(
+                {
+                    "count": len(imgs),
+                    "items": imgs,
+                    "note": "placeholder generator; replace backend when ready",
+                }
+            )
 
-    # Single mode
+        return {"items": out_list}
+
+    # Scalar mode
     prompt = _require_nonempty_str(payload.get("prompt"), "payload.prompt")
-
-    n_int = _require_int(payload.get("n", 1), "payload.n")
-    if n_int < 1 or n_int > 8:
+    n = _require_int(payload.get("n", 1), "payload.n")
+    if n < 1 or n > 8:
         raise OpError("INVALID_ARGUMENT", "payload.n must be between 1 and 8", retryable=False)
 
-    out = [_one(prompt, default_size) for _ in range(n_int)]
-    compute_ms = (time.time() - start) * 1000.0
+    imgs = [_one_image_raw(prompt, default_size) for _ in range(n)]
     return {
-        "ok": True,
-        "result": {
-            "count": len(out),
-            "items": out,
-            "note": "placeholder generator; replace backend when ready",
-        },
-        "metrics": {
-            "compute_time_ms": compute_ms,
-            "backend": _BACKEND,
-            "batched": False,
-            "batch_size": len(out),
-        },
+        "count": len(imgs),
+        "items": imgs,
+        "note": "placeholder generator; replace backend when ready",
     }
 
 
-# Tell the wrapper we support batch payloads in one call.
-# Even though placeholder mode doesn't speed up, the contract is correct and future-proof.
+# Wrapper fast-path: if input is a list, wrapper passes {"items":[...]} through in one call.
 map_image_gen.OP_SPEC = {"accepts_batch": True, "batch_key": "items", "result_key": "items"}

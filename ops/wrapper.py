@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import time
-import traceback
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 Json = Dict[str, Any]
-OpFn = Callable[[Dict[str, Any]], Dict[str, Any]]  # existing ops mostly accept dict payloads
+OpFn = Callable[[Dict[str, Any]], Dict[str, Any]]  # most ops accept dict payloads
 
 
 @dataclass
@@ -88,7 +87,7 @@ def _classify_exception(e: Exception) -> OpError:
     if isinstance(e, OpError):
         return e
 
-    # Common “bad input” paths (map_image_gen currently raises ValueError) :contentReference[oaicite:2]{index=2}
+    # Common “bad input” paths
     if isinstance(e, (ValueError, TypeError)):
         return OpError("INVALID_ARGUMENT", str(e) or "Invalid argument", retryable=False)
 
@@ -98,6 +97,16 @@ def _classify_exception(e: Exception) -> OpError:
         return OpError("OOM", msg, retryable=True)
 
     return OpError("INTERNAL", msg, retryable=True)
+
+
+def _get_op_spec(op_fn: Callable[..., Any]) -> Dict[str, Any]:
+    """
+    Optional op metadata.
+    Convention: attach a dict to the function object:
+        op_fn.OP_SPEC = {"accepts_batch": True, "batch_key": "items", "result_key": "items"}
+    """
+    spec = getattr(op_fn, "OP_SPEC", None)
+    return spec if isinstance(spec, dict) else {}
 
 
 def run_op(
@@ -111,8 +120,11 @@ def run_op(
     Execute an op under a strict envelope.
 
     - For non-map ops: passes a dict payload to op_fn and returns op output under result.
-    - For map_* ops: supports dict OR list input; calls op_fn per-item; returns list results.
-      (If you later build true batching in the op itself, you can special-case here.)
+    - For map_* ops:
+        * Accepts dict OR list input.
+        * If op advertises OP_SPEC.accepts_batch and input is a list, passes the whole batch
+          in a single call (GPU-friendly).
+        * Otherwise falls back to scalar-per-item execution (correct, slower).
     """
     t0 = _now_ms()
     meta = meta or {}
@@ -129,16 +141,34 @@ def run_op(
         if _is_map_op(op_name):
             is_batch, items = _normalize_map_input(p)
 
+            spec = _get_op_spec(op_fn)
+            accepts_batch = bool(spec.get("accepts_batch"))
+            batch_key = spec.get("batch_key", "items")
+            result_key = spec.get("result_key", "items")
+
+            # Fast path: pass batch through in one call (op handles true batching)
+            if is_batch and accepts_batch:
+                raw = op_fn({batch_key: items})
+
+                # If op returns {"items": [...]}, unwrap that to keep outer contract stable
+                if isinstance(raw, dict) and result_key in raw and isinstance(raw[result_key], list):
+                    result = raw[result_key]
+                else:
+                    result = raw
+
+                metrics["duration_ms"] = _now_ms() - t0
+                metrics["batched"] = True
+                metrics["batch_size"] = len(items)
+                return _wrap_success(result=result, metrics=metrics)
+
+            # Fallback: scalar-per-item (correct, slower)
             out_items: List[Any] = []
             for item in items:
-                raw = op_fn(item)
-
-                # Allow legacy “ok” shape to pass through as result, but normalize
-                # map_classify returns {"ok": True, "label": ..., ...} :contentReference[oaicite:3]{index=3}
-                # map_image_gen returns {"count":..., "items":..., ...} and no ok :contentReference[oaicite:4]{index=4}
-                out_items.append(raw)
+                out_items.append(op_fn(item))
 
             metrics["duration_ms"] = _now_ms() - t0
+            metrics["batched"] = False
+            metrics["batch_size"] = len(items)
             result = out_items if is_batch else out_items[0]
             return _wrap_success(result=result, metrics=metrics)
 
@@ -153,9 +183,4 @@ def run_op(
     except Exception as e:
         err = _classify_exception(e)
         metrics["duration_ms"] = _now_ms() - t0
-
-        # Optional: include traceback only when debugging, never by default.
-        # You can gate this behind an env var if you want.
-        # metrics["traceback"] = traceback.format_exc(limit=20)
-
         return _wrap_error(err=err, metrics=metrics)

@@ -106,6 +106,24 @@ _OP_MODULES = [
     "prime_factor",
     "subset_sum",
     "map_image_gen",
+
+    # GPU ops (new)
+    # artifacts.py provides artifact:// refs (binary blobs stored out-of-band)
+    "artifacts",
+    # gpu_state.py holds model/tensor caches (module-level dictionaries)
+    "gpu_state",
+    "gpu_probe",
+    "gpu_vram_stats",
+    "gpu_warmup",
+    "gpu_model_load",
+    "gpu_embed_image",
+    "gpu_detect",
+    "gpu_overlay",
+    "gpu_image_decode",
+    "gpu_image_encode",
+
+    # Optional (requires ffmpeg in PATH)
+    "gpu_video_encode",
 ]
 
 for _m in _OP_MODULES:

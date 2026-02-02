@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 Json = Dict[str, Any]
-OpFn = Callable[[Dict[str, Any]], Dict[str, Any]]  # most ops accept dict payloads
+# Ops return RAW results (any JSON-ish type). Wrapper owns the envelope.
+OpFn = Callable[[Dict[str, Any]], Any]  # most ops accept dict payloads
 
 
 @dataclass
@@ -16,8 +18,11 @@ class OpError(Exception):
     message: str
     retryable: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {"code": self.code, "message": self.message, "retryable": self.retryable}
+    def to_dict(self, *, trace: Optional[str] = None) -> Dict[str, Any]:
+        d = {"code": self.code, "message": self.message, "retryable": self.retryable}
+        if trace:
+            d["trace"] = trace
+        return d
 
 
 def _now_ms() -> float:
@@ -75,8 +80,8 @@ def _wrap_success(result: Any, metrics: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "result": result, "metrics": metrics}
 
 
-def _wrap_error(err: OpError, metrics: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ok": False, "error": err.to_dict(), "metrics": metrics}
+def _wrap_error(err: OpError, metrics: Dict[str, Any], *, trace: Optional[str] = None) -> Dict[str, Any]:
+    return {"ok": False, "error": err.to_dict(trace=trace), "metrics": metrics}
 
 
 def _classify_exception(e: Exception) -> OpError:
@@ -111,7 +116,7 @@ def _get_op_spec(op_fn: Callable[..., Any]) -> Dict[str, Any]:
 
 def run_op(
     op_name: str,
-    op_fn: Callable[[Dict[str, Any]], Dict[str, Any]],
+    op_fn: OpFn,
     payload: Any,
     *,
     meta: Optional[Dict[str, Any]] = None,
@@ -119,7 +124,11 @@ def run_op(
     """
     Execute an op under a strict envelope.
 
-    - For non-map ops: passes a dict payload to op_fn and returns op output under result.
+    Contract:
+      - Ops return RAW results (any JSON-ish type). They do NOT return {"ok": ...}.
+      - Wrapper ALWAYS returns {"ok": bool, "result"/"error": ..., "metrics": ...}
+
+    - For non-map ops: passes a dict payload to op_fn and returns raw output under result.
     - For map_* ops:
         * Accepts dict OR list input.
         * If op advertises OP_SPEC.accepts_batch and input is a list, passes the whole batch
@@ -134,6 +143,9 @@ def run_op(
         "started_ms": t0,
         "meta": meta,
     }
+
+    # Only include traceback when explicitly requested (keeps UI clean by default)
+    want_trace = bool(meta.get("debug"))
 
     try:
         p = _coerce_payload(payload)
@@ -150,13 +162,14 @@ def run_op(
             if is_batch and accepts_batch:
                 raw = op_fn({batch_key: items})
 
-                # If op returns {"items": [...]}, unwrap that to keep outer contract stable
+                # Compatibility: if an op returns {"items":[...]} we can unwrap
+                # to keep map results stable. Raw ops may also return a list directly.
                 if isinstance(raw, dict) and result_key in raw and isinstance(raw[result_key], list):
                     result = raw[result_key]
                 else:
                     result = raw
 
-                metrics["duration_ms"] = _now_ms() - t0
+                metrics["duration_ms"] = int(_now_ms() - t0)
                 metrics["batched"] = True
                 metrics["batch_size"] = len(items)
                 return _wrap_success(result=result, metrics=metrics)
@@ -166,7 +179,7 @@ def run_op(
             for item in items:
                 out_items.append(op_fn(item))
 
-            metrics["duration_ms"] = _now_ms() - t0
+            metrics["duration_ms"] = int(_now_ms() - t0)
             metrics["batched"] = False
             metrics["batch_size"] = len(items)
             result = out_items if is_batch else out_items[0]
@@ -177,10 +190,11 @@ def run_op(
             raise OpError("INVALID_ARGUMENT", "payload must be an object", retryable=False)
 
         raw = op_fn(p)
-        metrics["duration_ms"] = _now_ms() - t0
+        metrics["duration_ms"] = int(_now_ms() - t0)
         return _wrap_success(result=raw, metrics=metrics)
 
     except Exception as e:
         err = _classify_exception(e)
-        metrics["duration_ms"] = _now_ms() - t0
-        return _wrap_error(err=err, metrics=metrics)
+        metrics["duration_ms"] = int(_now_ms() - t0)
+        trace = traceback.format_exc() if want_trace else None
+        return _wrap_error(err=err, metrics=metrics, trace=trace)

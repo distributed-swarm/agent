@@ -71,7 +71,7 @@ if AGENT_LABELS_RAW.strip():
 # Keep this (useful for scheduling/visibility)
 BASE_LABELS["worker_profile"] = WORKER_PROFILE
 
-# Capabilities advertised to leasing endpoint (controller currently expects a LIST here)
+# Capabilities advertised to leasing endpoint
 CAPABILITIES_LIST: List[str] = list_ops()
 
 # ---------------- rate-limited logging ----------------
@@ -151,10 +151,11 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
 def _lease_once() -> Optional[Tuple[str, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
-        "capabilities": {"ops": CAPABILITIES_LIST},   # LIST (controller expects list)
+        # Keep as dict-of-ops (works with current controller); controller-side may accept list too.
+        "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
-        # optional fields for the future; safe to include now if controller ignores unknowns:
+        # optional fields (controller should ignore if not used)
         "labels": BASE_LABELS,
         "worker_profile": WORKER_PROFILE,
         "metrics": _collect_metrics(),
@@ -183,12 +184,25 @@ def _lease_once() -> Optional[Tuple[str, Dict[str, Any]]]:
 
     if not task:
         return None
+
+    # Some controllers may put job_epoch at top-level; copy into task if missing.
+    if "job_epoch" not in task and "job_epoch" in body:
+        task["job_epoch"] = body["job_epoch"]
+
     return lease_id, task
 
-def _post_result(lease_id: str, job_id: str, status: str, result: Any = None, error: Any = None) -> None:
+def _post_result(
+    lease_id: str,
+    job_id: str,
+    job_epoch: int,
+    status: str,
+    result: Any = None,
+    error: Any = None,
+) -> None:
     payload: Dict[str, Any] = {
         "lease_id": lease_id,
         "job_id": job_id,
+        "job_epoch": int(job_epoch),
         "status": status,
         "result": result,
         "error": error,
@@ -199,15 +213,26 @@ def _post_result(lease_id: str, job_id: str, status: str, result: Any = None, er
     if code >= 400:
         raise RuntimeError(f"result HTTP {code}: {body}")
 
-def _extract_task(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+def _extract_task(task: Dict[str, Any]) -> Tuple[str, int, str, Dict[str, Any]]:
     job_id = str(task.get("job_id") or task.get("id") or "")
     op = str(task.get("op") or "")
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+
+    job_epoch_raw = task.get("job_epoch", None)
+    if job_epoch_raw is None:
+        raise ValueError(f"missing job_epoch in task: {task}")
+
+    try:
+        job_epoch = int(job_epoch_raw)
+    except Exception:
+        raise ValueError(f"bad job_epoch={job_epoch_raw!r} in task: {task}")
+
     if not job_id:
         raise ValueError(f"missing job_id in task: {task}")
     if not op:
         raise ValueError(f"missing op in task: {task}")
-    return job_id, op, payload
+
+    return job_id, job_epoch, op, payload
 
 # ---------------- signal handling ----------------
 
@@ -241,7 +266,7 @@ def main() -> int:
 
         lease_id, task = leased
         try:
-            job_id, op, payload = _extract_task(task)
+            job_id, job_epoch, op, payload = _extract_task(task)
         except Exception as e:
             _log_err_ratelimited("task:bad", f"[agent-v1] bad task: {e} task={repr(task)[:300]}")
             continue
@@ -264,7 +289,14 @@ def main() -> int:
         _record_task_result(duration_ms, ok)
 
         try:
-            _post_result(lease_id, job_id, "succeeded" if ok else "failed", result=out if ok else None, error=None if ok else err)
+            _post_result(
+                lease_id=lease_id,
+                job_id=job_id,
+                job_epoch=job_epoch,
+                status="succeeded" if ok else "failed",
+                result=out if ok else None,
+                error=None if ok else err,
+            )
         except Exception as e:
             _log_err_ratelimited("result", f"[agent-v1] post result error: {e}")
 

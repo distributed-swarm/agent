@@ -1,143 +1,76 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import importlib
+import json
 import os
-import time
-import socket
 import signal
-import threading
+import sys
+import time
 import traceback
-from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-# Optional metrics
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
-from worker_sizing import build_worker_profile
-from ops import list_ops, get_op  # plugin-based ops registry
-
 # ---------------- config ----------------
 
-CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080").rstrip("/")
-# If your controller routes are under /api, set API_PREFIX=/api
-API_PREFIX = os.getenv("API_PREFIX", "").rstrip("/")  # "", "/api"
-AGENT_NAME = os.getenv("AGENT_NAME", socket.gethostname())
+CTRL = os.environ.get("CONTROLLER_URL", "http://localhost:8080").rstrip("/")
+AGENT_NAME = os.environ.get("AGENT_NAME", "agent-1")
+API_PREFIX = os.environ.get("API_PREFIX", "")  # keep empty for v1-only
 
-HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "10"))
-IDLE_SLEEP_SEC = float(os.getenv("IDLE_SLEEP_SEC", "0.25"))
+HTTP_TIMEOUT_SEC = float(os.environ.get("HTTP_TIMEOUT_SEC", "10"))
+LEASE_TIMEOUT_MS = int(os.environ.get("LEASE_TIMEOUT_MS", "2000"))
+ERROR_BACKOFF_SEC = float(os.environ.get("ERROR_BACKOFF_SEC", "0.5"))
+MAX_TASKS = int(os.environ.get("MAX_TASKS", "1"))
 
-# leasing params
-MAX_TASKS = int(os.getenv("MAX_TASKS", "1"))
-LEASE_TIMEOUT_MS = int(os.getenv("LEASE_TIMEOUT_MS", os.getenv("WAIT_MS", "3000")))
+# Optional identity/metadata
+BASE_LABELS: Dict[str, str] = {}
+WORKER_PROFILE: Dict[str, Any] = {}
 
-# If controller is down, avoid hot-loop + log spam
-ERROR_LOG_EVERY_SEC = float(os.getenv("ERROR_LOG_EVERY_SEC", "10"))
-ERROR_BACKOFF_SEC = float(os.getenv("ERROR_BACKOFF_SEC", "1.0"))
+# ---------------- ops loading ----------------
 
-AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
+OPS_MODULES = [
+    # CPU-ish ops
+    "ops.echo",
+    "ops.map_tokenize",
+    "ops.map_summarize",
+    "ops.csv_shard",
+    "ops.map_classify",
+    "ops.risk_accumulate",
+    "ops.sat_verify",
+    "ops.fibonacci",
+    "ops.prime_factor",
+    "ops.subset_sum",
+    "ops.map_image_gen",
+    # GPU ops (may or may not exist; import guarded below)
+    "ops.gpu_state",
+    "ops.gpu_probe",
+    "ops.gpu_vram_stats",
+    "ops.gpu_warmup",
+    "ops.gpu_model_load",
+    "ops.gpu_embed_image",
+    "ops.gpu_detect",
+    "ops.gpu_overlay",
+    "ops.gpu_image_decode",
+    "ops.gpu_image_encode",
+    "ops.gpu_video_encode",
+]
 
-_running = True
+OPS: Dict[str, Any] = {}
+CAPABILITIES_LIST: List[str] = []
 
-# ---------------- Local metrics tracking ----------------
-
-_metrics_lock = threading.Lock()
-_tasks_completed = 0
-_tasks_failed = 0
-_task_durations: List[float] = []
-_max_duration_samples = 100  # Rolling window size
-
-# ---------------- worker profile / labels ----------------
-
-WORKER_PROFILE = build_worker_profile()
-
-BASE_LABELS: Dict[str, Any] = {}
-
-# Parse AGENT_LABELS="key=value,key2=value2"
-if AGENT_LABELS_RAW.strip():
-    for item in AGENT_LABELS_RAW.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" in item:
-            k, v = item.split("=", 1)
-            BASE_LABELS[k.strip()] = v.strip()
-        else:
-            BASE_LABELS[item] = True
-
-# Keep this (useful for scheduling/visibility)
-BASE_LABELS["worker_profile"] = WORKER_PROFILE
-
-# Capabilities advertised to leasing endpoint
-CAPABILITIES_LIST: List[str] = list_ops()
-
-# ---------------- rate-limited logging ----------------
-
-_last_err: Dict[str, float] = {}
-
-def log(msg: str, **kv: Any) -> None:
-    extra = (" " + " ".join(f"{k}={v!r}" for k, v in kv.items())) if kv else ""
-    print(f"[agent-v1] {msg}{extra}", flush=True)
-
-def _log_err_ratelimited(key: str, msg: str) -> None:
-    now = time.time()
-    last = _last_err.get(key, 0.0)
-    if now - last >= ERROR_LOG_EVERY_SEC:
-        print(msg, flush=True)
-        _last_err[key] = now
-
-# ---------------- metrics helpers ----------------
-
-def _record_task_result(duration_ms: float, ok: bool) -> None:
-    global _tasks_completed, _tasks_failed, _task_durations
-    with _metrics_lock:
-        if ok:
-            _tasks_completed += 1
-        else:
-            _tasks_failed += 1
-        _task_durations.append(duration_ms)
-        if len(_task_durations) > _max_duration_samples:
-            _task_durations.pop(0)
-
-def _collect_metrics() -> Dict[str, Any]:
-    metrics: Dict[str, Any] = {}
-    if psutil is not None:
-        try:
-            metrics["cpu_util"] = psutil.cpu_percent(interval=0.0) / 100.0
-        except Exception:
-            pass
-        try:
-            vm = psutil.virtual_memory()
-            metrics["ram_mb"] = int(vm.used / (1024 * 1024))
-        except Exception:
-            pass
-    with _metrics_lock:
-        metrics["tasks_completed"] = _tasks_completed
-        metrics["tasks_failed"] = _tasks_failed
-        if _task_durations:
-            metrics["avg_task_ms"] = sum(_task_durations) / len(_task_durations)
-    return metrics
-
-# ---------------- HTTP helpers ----------------
+# ---------------- http helpers ----------------
 
 _session = requests.Session()
 
-def _url(path: str) -> str:
-    if not path.startswith("/"):
-        path = "/" + path
-    # API_PREFIX is "" or "/api"
-    return f"{CONTROLLER_URL}{API_PREFIX}{path}"
 
-def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
-    url = _url(path)
+def _post_json(path: str, payload: Any) -> Tuple[int, Any]:
+    url = CTRL.rstrip("/") + path
     try:
         resp = _session.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
-        if resp.status_code == 204:
-            return 204, None
-        ct = (resp.headers.get("content-type") or "").lower()
+        ct = resp.headers.get("content-type", "")
         if "application/json" in ct and resp.content:
             return resp.status_code, resp.json()
         return resp.status_code, resp.text
@@ -146,16 +79,63 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
         time.sleep(ERROR_BACKOFF_SEC)
         return 0, f"{type(e).__name__}: {e}"
 
+
+def _get_json(path: str) -> Tuple[int, Any]:
+    url = CTRL.rstrip("/") + path
+    try:
+        resp = _session.get(url, timeout=HTTP_TIMEOUT_SEC)
+        ct = resp.headers.get("content-type", "")
+        if "application/json" in ct and resp.content:
+            return resp.status_code, resp.json()
+        return resp.status_code, resp.text
+    except Exception as e:
+        _log_err_ratelimited("get:" + path, f"[agent-v1] GET {url} failed: {e}")
+        time.sleep(ERROR_BACKOFF_SEC)
+        return 0, f"{type(e).__name__}: {e}"
+
+
+_last_err: Dict[str, float] = {}
+
+
+def _log_err_ratelimited(key: str, msg: str, every_sec: float = 1.0) -> None:
+    now = time.time()
+    prev = _last_err.get(key, 0.0)
+    if now - prev >= every_sec:
+        _last_err[key] = now
+        print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------- metrics (minimal) ----------------
+
+
+def _collect_metrics() -> Dict[str, Any]:
+    # Keep super minimal; controller can ignore unknown fields.
+    return {
+        "ts": time.time(),
+    }
+
+
 # ---------------- v1 lease / result ----------------
 
-def _lease_once() -> Optional[Tuple[str, Dict[str, Any]]]:
+
+def _get_job_epoch(job_id: str) -> Optional[int]:
+    code, body = _get_json(f"/v1/jobs/{job_id}")
+    if code != 200 or not isinstance(body, dict):
+        return None
+    je = body.get("job_epoch")
+    try:
+        return int(je)
+    except Exception:
+        return None
+
+
+def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
-        # Keep as dict-of-ops (works with current controller); controller-side may accept list too.
+        # Send capabilities as dict for extensibility; controller normalizes list|dict.
         "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
-        # optional fields (controller should ignore if not used)
         "labels": BASE_LABELS,
         "worker_profile": WORKER_PROFILE,
         "metrics": _collect_metrics(),
@@ -185,11 +165,18 @@ def _lease_once() -> Optional[Tuple[str, Dict[str, Any]]]:
     if not task:
         return None
 
-    # Some controllers may put job_epoch at top-level; copy into task if missing.
-    if "job_epoch" not in task and "job_epoch" in body:
-        task["job_epoch"] = body["job_epoch"]
+    # IMPORTANT: job_epoch is required by controller for /v1/results.
+    job_epoch = task.get("job_epoch") or body.get("job_epoch")
+    if job_epoch is None:
+        job_id = str(task.get("job_id") or task.get("id") or "")
+        if job_id:
+            job_epoch = _get_job_epoch(job_id)
 
-    return lease_id, task
+    if job_epoch is None:
+        raise RuntimeError(f"missing job_epoch in lease response: {body}")
+
+    return lease_id, int(job_epoch), task
+
 
 def _post_result(
     lease_id: str,
@@ -199,6 +186,7 @@ def _post_result(
     result: Any = None,
     error: Any = None,
 ) -> None:
+    # job_epoch fences stale results; controller requires it (422 if missing).
     payload: Dict[str, Any] = {
         "lease_id": lease_id,
         "job_id": job_id,
@@ -213,95 +201,103 @@ def _post_result(
     if code >= 400:
         raise RuntimeError(f"result HTTP {code}: {body}")
 
-def _extract_task(task: Dict[str, Any]) -> Tuple[str, int, str, Dict[str, Any]]:
+
+# ---------------- task execution ----------------
+
+
+def _extract_task_fields(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
     job_id = str(task.get("job_id") or task.get("id") or "")
     op = str(task.get("op") or "")
-    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    payload = task.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {"payload": payload}
+    if not job_id or not op:
+        raise ValueError(f"bad task: {task}")
+    return job_id, op, payload
 
-    job_epoch_raw = task.get("job_epoch", None)
-    if job_epoch_raw is None:
-        raise ValueError(f"missing job_epoch in task: {task}")
 
-    try:
-        job_epoch = int(job_epoch_raw)
-    except Exception:
-        raise ValueError(f"bad job_epoch={job_epoch_raw!r} in task: {task}")
+def _run_task(op: str, payload: Dict[str, Any]) -> Any:
+    fn = OPS.get(op)
+    if fn is None:
+        raise RuntimeError(f"unknown op: {op}")
+    return fn(payload)
 
-    if not job_id:
-        raise ValueError(f"missing job_id in task: {task}")
-    if not op:
-        raise ValueError(f"missing op in task: {task}")
 
-    return job_id, job_epoch, op, payload
+# ---------------- main loop ----------------
 
-# ---------------- signal handling ----------------
+_stop = False
 
-def _stop(*_args, **_kwargs):
-    global _running
-    log("stop signal received, shutting down...")
-    _running = False
 
-signal.signal(signal.SIGINT, _stop)
-signal.signal(signal.SIGTERM, _stop)
+def _handle_sigterm(_signo: int, _frame: Any) -> None:
+    global _stop
+    _stop = True
+    print("[agent-v1] stop signal received, shutting down...", flush=True)
 
-# ---------------- main ----------------
 
 def main() -> int:
-    log("starting v1-only", controller=CONTROLLER_URL, api_prefix=API_PREFIX, agent=AGENT_NAME, ops=CAPABILITIES_LIST)
-    if not CAPABILITIES_LIST:
-        log("no ops registered; exiting")
-        return 2
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
 
-    while _running:
+    print(
+        f"[agent-v1] starting v1-only controller='{CTRL}' api_prefix='{API_PREFIX}' "
+        f"agent='{AGENT_NAME}' ops={CAPABILITIES_LIST}",
+        flush=True,
+    )
+
+    while not _stop:
         try:
             leased = _lease_once()
+            if not leased:
+                time.sleep(0.05)
+                continue
+
+            lease_id, job_epoch, task = leased
+            job_id, op, payload = _extract_task_fields(task)
+
+            try:
+                out = _run_task(op, payload)
+                _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)
+            except Exception as e:
+                err = {
+                    "type": type(e).__name__,
+                    "message": str(e),
+                    "trace": traceback.format_exc(),
+                }
+                try:
+                    _post_result(lease_id, job_id, job_epoch, "failed", None, err)
+                except Exception as post_e:
+                    _log_err_ratelimited(
+                        "post_result",
+                        f"[agent-v1] post result error: {post_e}",
+                    )
+
         except Exception as e:
-            _log_err_ratelimited("lease", f"[agent-v1] lease error: {e}")
+            _log_err_ratelimited("loop", f"[agent-v1] loop error: {e}")
             time.sleep(ERROR_BACKOFF_SEC)
-            continue
 
-        if not leased:
-            time.sleep(IDLE_SLEEP_SEC)
-            continue
-
-        lease_id, task = leased
-        try:
-            job_id, job_epoch, op, payload = _extract_task(task)
-        except Exception as e:
-            _log_err_ratelimited("task:bad", f"[agent-v1] bad task: {e} task={repr(task)[:300]}")
-            continue
-
-        start_ts = time.time()
-        ok = True
-        out: Any = None
-        err: Any = None
-
-        try:
-            fn = get_op(op)
-            if fn is None:
-                raise RuntimeError(f"Unknown op '{op}'")
-            out = fn(payload)
-        except Exception as e:
-            ok = False
-            err = {"type": type(e).__name__, "message": str(e), "trace": traceback.format_exc(limit=12)}
-
-        duration_ms = (time.time() - start_ts) * 1000.0
-        _record_task_result(duration_ms, ok)
-
-        try:
-            _post_result(
-                lease_id=lease_id,
-                job_id=job_id,
-                job_epoch=job_epoch,
-                status="succeeded" if ok else "failed",
-                result=out if ok else None,
-                error=None if ok else err,
-            )
-        except Exception as e:
-            _log_err_ratelimited("result", f"[agent-v1] post result error: {e}")
-
-    log("stopped")
+    print("[agent-v1] stopped", flush=True)
     return 0
 
+
+def _try_import_ops() -> None:
+    global OPS, CAPABILITIES_LIST
+
+    for modname in OPS_MODULES:
+        try:
+            print(f"[ops] importing {modname}", flush=True)
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+
+        # Convention: module exports OPS = {"op_name": callable, ...}
+        if hasattr(mod, "OPS") and isinstance(mod.OPS, dict):
+            for k, v in mod.OPS.items():
+                if callable(v):
+                    OPS[k] = v
+
+    CAPABILITIES_LIST = sorted(list(OPS.keys()))
+
+
 if __name__ == "__main__":
+    _try_import_ops()
     raise SystemExit(main())

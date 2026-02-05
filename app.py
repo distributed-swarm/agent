@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import base64
 import importlib
-import json
 import os
 import signal
 import sys
 import time
 import traceback
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -65,6 +62,16 @@ CAPABILITIES_LIST: List[str] = []
 
 _session = requests.Session()
 
+_last_err: Dict[str, float] = {}
+
+
+def _log_err_ratelimited(key: str, msg: str, every_sec: float = 1.0) -> None:
+    now = time.time()
+    prev = _last_err.get(key, 0.0)
+    if now - prev >= every_sec:
+        _last_err[key] = now
+        print(msg, file=sys.stderr, flush=True)
+
 
 def _post_json(path: str, payload: Any) -> Tuple[int, Any]:
     url = CTRL.rstrip("/") + path
@@ -94,45 +101,42 @@ def _get_json(path: str) -> Tuple[int, Any]:
         return 0, f"{type(e).__name__}: {e}"
 
 
-_last_err: Dict[str, float] = {}
-
-
-def _log_err_ratelimited(key: str, msg: str, every_sec: float = 1.0) -> None:
-    now = time.time()
-    prev = _last_err.get(key, 0.0)
-    if now - prev >= every_sec:
-        _last_err[key] = now
-        print(msg, file=sys.stderr, flush=True)
-
-
 # ---------------- metrics (minimal) ----------------
 
 
 def _collect_metrics() -> Dict[str, Any]:
-    # Keep super minimal; controller can ignore unknown fields.
-    return {
-        "ts": time.time(),
-    }
+    return {"ts": time.time()}
 
 
 # ---------------- v1 lease / result ----------------
 
+# Cache epochs to avoid repeated GETs if the controller omits job_epoch in lease payload.
+_epoch_cache: Dict[str, int] = {}
+
 
 def _get_job_epoch(job_id: str) -> Optional[int]:
-    code, body = _get_json(f"/v1/jobs/{job_id}")
-    if code != 200 or not isinstance(body, dict):
-        return None
-    je = body.get("job_epoch")
-    try:
-        return int(je)
-    except Exception:
-        return None
+    if job_id in _epoch_cache:
+        return _epoch_cache[job_id]
+
+    # 1 retry (helps during controller restart / brief race)
+    for _ in range(2):
+        code, body = _get_json(f"/v1/jobs/{job_id}")
+        if code == 200 and isinstance(body, dict):
+            je = body.get("job_epoch")
+            try:
+                val = int(je)
+                _epoch_cache[job_id] = val
+                return val
+            except Exception:
+                return None
+        time.sleep(0.05)
+    return None
 
 
 def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
-        # Send capabilities as dict for extensibility; controller normalizes list|dict.
+        # dict form is fine; controller normalizes list|dict
         "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
@@ -141,13 +145,13 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         "metrics": _collect_metrics(),
     }
     code, body = _post_json("/v1/leases", payload)
+
     if code == 204:
         return None
     if code == 0:
         raise RuntimeError(f"lease failed: {body}")
     if code >= 400:
         raise RuntimeError(f"lease HTTP {code}: {body}")
-
     if not isinstance(body, dict):
         raise RuntimeError(f"lease body not dict: {body!r}")
 
@@ -165,17 +169,24 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     if not task:
         return None
 
-    # IMPORTANT: job_epoch is required by controller for /v1/results.
+    # job_epoch MUST be present for /v1/results
     job_epoch = task.get("job_epoch") or body.get("job_epoch")
+
     if job_epoch is None:
         job_id = str(task.get("job_id") or task.get("id") or "")
         if job_id:
             job_epoch = _get_job_epoch(job_id)
 
     if job_epoch is None:
+        # At this point we cannot safely post a result (controller will 422).
         raise RuntimeError(f"missing job_epoch in lease response: {body}")
 
-    return lease_id, int(job_epoch), task
+    try:
+        job_epoch_i = int(job_epoch)
+    except Exception:
+        raise RuntimeError(f"invalid job_epoch={job_epoch!r} in lease response: {body}")
+
+    return lease_id, job_epoch_i, task
 
 
 def _post_result(
@@ -186,11 +197,10 @@ def _post_result(
     result: Any = None,
     error: Any = None,
 ) -> None:
-    # job_epoch fences stale results; controller requires it (422 if missing).
     payload: Dict[str, Any] = {
         "lease_id": lease_id,
         "job_id": job_id,
-        "job_epoch": int(job_epoch),
+        "job_epoch": int(job_epoch),  # REQUIRED by controller
         "status": status,
         "result": result,
         "error": error,
@@ -205,14 +215,23 @@ def _post_result(
 # ---------------- task execution ----------------
 
 
+def _task_job_id(task: Dict[str, Any]) -> str:
+    return str(task.get("job_id") or task.get("id") or "")
+
+
 def _extract_task_fields(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-    job_id = str(task.get("job_id") or task.get("id") or "")
+    job_id = _task_job_id(task)
     op = str(task.get("op") or "")
-    payload = task.get("payload") or {}
+    payload = task.get("payload")
+    if payload is None:
+        payload = {}
     if not isinstance(payload, dict):
         payload = {"payload": payload}
-    if not job_id or not op:
-        raise ValueError(f"bad task: {task}")
+
+    if not job_id:
+        raise ValueError(f"bad task: missing job_id: {task}")
+    if not op:
+        raise ValueError(f"bad task: missing op: {task}")
     return job_id, op, payload
 
 
@@ -252,8 +271,34 @@ def main() -> int:
                 continue
 
             lease_id, job_epoch, task = leased
-            job_id, op, payload = _extract_task_fields(task)
 
+            # IMPORTANT: if task is malformed, still close the lease with a FAILED result if we have job_id.
+            try:
+                job_id, op, payload = _extract_task_fields(task)
+            except Exception as e:
+                job_id = _task_job_id(task)
+                err = {
+                    "type": type(e).__name__,
+                    "message": str(e),
+                    "trace": traceback.format_exc(),
+                    "task": task,
+                }
+                if job_id:
+                    try:
+                        _post_result(lease_id, job_id, job_epoch, "failed", None, err)
+                    except Exception as post_e:
+                        _log_err_ratelimited(
+                            "post_result_bad_task",
+                            f"[agent-v1] post result error (bad task): {post_e}",
+                        )
+                else:
+                    _log_err_ratelimited(
+                        "bad_task_no_jobid",
+                        f"[agent-v1] bad task with no job_id; cannot post result: {e}; task={task}",
+                    )
+                continue
+
+            # Normal execution path
             try:
                 out = _run_task(op, payload)
                 _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)

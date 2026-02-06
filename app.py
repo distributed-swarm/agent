@@ -408,7 +408,7 @@ def main() -> int:
             try:
                 out = _run_task(op, payload)
                 # Controller semantics: terminal success is "completed"
-                _post_result(lease_id, job_id, job_epoch, "completed", out, None)
+                _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)
             except Exception as e:
                 err = {
                     "type": type(e).__name__,

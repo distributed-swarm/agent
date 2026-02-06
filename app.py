@@ -27,6 +27,12 @@ BASE_LABELS: Dict[str, str] = {}
 WORKER_PROFILE: Dict[str, Any] = {}
 
 # ---------------- ops loading ----------------
+#
+# Design:
+# - ops/__init__.py is registry-only and MUST NOT import modules (prevents circular imports).
+# - app.py decides which modules to import for this agent build.
+# - Importing a module may register ops by side-effect (via ops.register_op).
+# - We also support modules that expose handle/OPS/register_op without side-effects.
 
 OPS_MODULES = [
     # CPU-ish ops
@@ -41,7 +47,7 @@ OPS_MODULES = [
     "ops.prime_factor",
     "ops.subset_sum",
     "ops.map_image_gen",
-    # GPU ops (may or may not exist; import guarded below)
+    # GPU ops (may or may not exist; import guarded)
     "ops.gpu_state",
     "ops.gpu_probe",
     "ops.gpu_vram_stats",
@@ -133,7 +139,7 @@ def _get_job_epoch(job_id: str) -> Optional[int]:
 def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
-        # controller normalizes list|dict; we send dict form for extensibility
+        # send dict form for extensibility; controller normalizes
         "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
@@ -188,7 +194,7 @@ def _post_result(
     lease_id: str,
     job_id: str,
     job_epoch: int,
-    status: str,
+    status: str,          # MUST be "succeeded" or "failed"
     result: Any = None,
     error: Any = None,
 ) -> None:
@@ -237,103 +243,93 @@ def _run_task(op: str, payload: Dict[str, Any]) -> Any:
     return fn(payload)
 
 
-# ---------------- ops loader (FIXED) ----------------
+# ---------------- ops loader ----------------
 
 
 def _module_basename(modname: str) -> str:
-    # "ops.gpu_warmup" -> "gpu_warmup"
     return modname.split(".")[-1].strip()
 
 
 def _try_register_from_module(modname: str, mod: Any) -> None:
     """
-    Populate OPS from an ops module using multiple conventions:
+    Populate OPS from an ops module using multiple conventions.
 
-    1) module.OPS dict: {"op_name": callable, ...}
-    2) module.register_op: tries common signatures:
-       - register_op(OPS)
-       - register_op(OPS, op_name)
-       - register_op() -> dict
-    3) module.handle(payload) callable: op_name defaults to module basename
-    4) ops.echo.echo_op(payload): op_name "echo"
+    Primary (preferred):
+      - module import side-effects call ops.register_op(), which fills ops.OPS
+
+    Additional supported conventions (keeps you compatible with older modules):
+      1) module.OPS dict: {"op_name": callable, ...}
+      2) module.handle(payload): op_name defaults to module basename
+      3) module.register_op(...) used as a "factory" (best-effort)
+      4) ops.echo.echo_op(payload): op_name "echo"
     """
     global OPS
 
-    # (1) OPS dict convention
-    if hasattr(mod, "OPS") and isinstance(getattr(mod, "OPS"), dict):
-        for k, v in getattr(mod, "OPS").items():
+    # (1) module.OPS dict
+    mod_ops = getattr(mod, "OPS", None)
+    if isinstance(mod_ops, dict):
+        for k, v in mod_ops.items():
             if isinstance(k, str) and callable(v):
                 OPS[k] = v
         return
 
-    # (2) register_op convention
-    reg = getattr(mod, "register_op", None)
-    if callable(reg):
-        base = _module_basename(modname)
-
-        # Try register_op(OPS)
-        try:
-            out = reg(OPS)  # type: ignore[misc]
-            if isinstance(out, dict):
-                for k, v in out.items():
-                    if isinstance(k, str) and callable(v):
-                        OPS[k] = v
-                return
-        except TypeError:
-            pass
-
-        # Try register_op(OPS, op_name)
-        try:
-            out = reg(OPS, base)  # type: ignore[misc]
-            if isinstance(out, dict):
-                for k, v in out.items():
-                    if isinstance(k, str) and callable(v):
-                        OPS[k] = v
-                return
-            # If it registered in-place, accept that too.
-            if base in OPS:
-                return
-        except TypeError:
-            pass
-
-        # Try register_op() -> dict
-        try:
-            out = reg()  # type: ignore[misc]
-            if isinstance(out, dict):
-                for k, v in out.items():
-                    if isinstance(k, str) and callable(v):
-                        OPS[k] = v
-                return
-        except TypeError:
-            pass
-
-        # If register_op exists but we couldn't call it, continue to fallback
-        # instead of silently succeeding.
-
-    # (3) handle convention
+    # (2) handle convention
     handle = getattr(mod, "handle", None)
     if callable(handle):
         OPS[_module_basename(modname)] = handle
         return
 
-    # (4) echo special-case: echo_op convention
+    # (4) echo special-case
     if modname == "ops.echo":
         echo_op = getattr(mod, "echo_op", None)
         if callable(echo_op):
             OPS["echo"] = echo_op
             return
 
+    # (3) register_op factory convention (best-effort; non-fatal)
+    reg = getattr(mod, "register_op", None)
+    if callable(reg):
+        base = _module_basename(modname)
+        for attempt in (
+            lambda: reg(OPS),
+            lambda: reg(OPS, base),
+            lambda: reg(),
+        ):
+            try:
+                out = attempt()
+                if isinstance(out, dict):
+                    for k, v in out.items():
+                        if isinstance(k, str) and callable(v):
+                            OPS[k] = v
+                    return
+                if base in OPS:
+                    return
+            except TypeError:
+                continue
+
 
 def _try_import_ops() -> None:
+    """
+    Load ops modules for this agent build.
+
+    Important:
+      - ops/__init__.py is registry-only, so importing ops here is safe.
+      - Many modules self-register via ops.register_op on import.
+      - We then merge ops.OPS into local OPS for fast dispatch.
+    """
     global OPS, CAPABILITIES_LIST
 
     OPS = {}
+
+    # Import registry package first
+    import ops as ops_pkg  # noqa: F401
+
     for modname in OPS_MODULES:
         try:
             print(f"[ops] importing {modname}", flush=True)
             mod = importlib.import_module(modname)
         except Exception:
-            # Modules may not exist on some agents (e.g., GPU ops on CPU-only)
+            # Some ops modules may not exist on some images; ignore
             continue
 
         try:
@@ -343,6 +339,17 @@ def _try_import_ops() -> None:
                 "ops_register",
                 f"[agent-v1] op register failed for {modname}: {type(e).__name__}: {e}",
             )
+
+    # Merge anything registered via ops.register_op side-effects
+    try:
+        import ops as ops_pkg2
+        pkg_ops = getattr(ops_pkg2, "OPS", {})
+        if isinstance(pkg_ops, dict):
+            for k, v in pkg_ops.items():
+                if isinstance(k, str) and callable(v):
+                    OPS.setdefault(k, v)
+    except Exception:
+        pass
 
     CAPABILITIES_LIST = sorted(list(OPS.keys()))
 
@@ -362,7 +369,6 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
-    # Ensure OPS + capabilities are loaded before we announce/register/lease.
     _try_import_ops()
 
     print(
@@ -407,7 +413,6 @@ def main() -> int:
 
             try:
                 out = _run_task(op, payload)
-                # Controller semantics: terminal success is "completed"
                 _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)
             except Exception as e:
                 err = {

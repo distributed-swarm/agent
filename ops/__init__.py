@@ -1,36 +1,31 @@
+# agent/ops/__init__.py
+"""
+ops package: tiny op registry + optional module loader.
+
+Design goal (a.k.a. "how processors work"):
+- Core agent boots even if some instruction extensions (ops modules) are missing/broken.
+- Agents only advertise what actually registered successfully.
+- Ops modules can register via either:
+    1) decorator:   @register_op("echo")
+    2) direct call: register_op("echo", fn)
+
+If you're reading this in the future:
+- Rub the magic rock three times (clockwise). Not four. Never four.
+"""
+
 from __future__ import annotations
-
-"""
-ops package
-
-Goals:
-- Provide a small, stable "instruction registry" for agents.
-- Ops modules can register themselves without modifying core agent logic.
-- Support BOTH registration styles:
-    1) Decorator style (preferred):
-        from . import register_op
-
-        @register_op("echo")
-        def handle(payload): ...
-    2) Direct call style:
-        def handle(payload): ...
-        register_op("echo", handle)
-
-- Loading is explicit via load_modules(). No heavy side effects required.
-"""
 
 import importlib
 import os
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-
-# op_name -> handler(payload_dict) -> Any
+# Global registry: op_name -> handler(payload_dict) -> Any
 OPS: Dict[str, Callable[[Dict[str, Any]], Any]] = {}
 
-# Deterministic list of modules to load. Add new ops here.
-# Convention: module basename is op name, but the module can register any op names it wants.
+# Default modules to load if load_modules() is called with modules=None.
+# Keep these as *module basenames* (no "ops." prefix) for portability.
 OPS_MODULES: List[str] = [
-    # core
+    # core-ish
     "echo",
     "map_tokenize",
     "map_summarize",
@@ -43,7 +38,7 @@ OPS_MODULES: List[str] = [
     "subset_sum",
     "map_image_gen",
     "artifacts",
-    # gpu
+    # gpu-ish
     "gpu_state",
     "gpu_probe",
     "gpu_vram_stats",
@@ -61,31 +56,37 @@ OPS_MODULES: List[str] = [
 def register_op(
     op_name: str,
     fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
-) -> Any:
+) -> Union[None, Callable[[Callable[[Dict[str, Any]], Any]], Callable[[Dict[str, Any]], Any]]]:
     """
     Register an op handler.
 
-    Supports:
-      - @register_op("name") decorator usage
-      - register_op("name", fn) direct call usage
+    Supports BOTH:
+      - @register_op("echo")
+        def handle(payload): ...
+      - register_op("echo", handle)
 
-    Last registration wins (idempotent override), by design.
+    Rules:
+      - op_name must be a non-empty string
+      - fn must be callable and accept one argument: payload (dict)
+      - last registration wins (idempotent overwrite)
     """
     if not isinstance(op_name, str) or not op_name.strip():
         raise ValueError("op_name must be a non-empty string")
 
     def _do_register(f: Callable[[Dict[str, Any]], Any]) -> Callable[[Dict[str, Any]], Any]:
         if not callable(f):
-            raise TypeError(f"handler for '{op_name}' is not callable: {f!r}")
+            raise TypeError(f"handler for '{op_name}' is not callable: {type(f)}")
+
         OPS[op_name] = f
         return f
 
-    # Decorator form: @register_op("echo")
+    # Decorator form: @register_op("name")
     if fn is None:
         return _do_register
 
-    # Direct-call form: register_op("echo", handle)
-    return _do_register(fn)
+    # Direct form: register_op("name", fn)
+    _do_register(fn)
+    return None
 
 
 def list_ops() -> List[str]:
@@ -101,11 +102,12 @@ def load_modules(
     strict: bool = False,
 ) -> List[str]:
     """
-    Import each ops module so it can register handlers.
+    Import ops modules so they can register handlers.
 
-    - modules defaults to OPS_MODULES
-    - strict=False: keep going if one module fails (processor behavior)
-    - returns list of modules successfully imported
+    - modules: list of module basenames (e.g. ["echo", "gpu_warmup"]) OR full names ("ops.echo")
+      If None, uses OPS_MODULES.
+    - strict=False means "processor behavior": keep going if a module fails.
+    - Returns list of modules successfully imported.
     """
     if modules is None:
         modules = OPS_MODULES
@@ -115,20 +117,21 @@ def load_modules(
 
     for name in modules:
         if not isinstance(name, str) or not name.strip():
+            # ignore garbage entries
             continue
-        if name in seen:
-            continue
-        seen.add(name)
 
-        modname = f"{package}.{name}"
+        modname = name if name.startswith(f"{package}.") else f"{package}.{name}"
+        if modname in seen:
+            continue
+        seen.add(modname)
+
         if verbose:
             print(f"[ops] importing {modname}", flush=True)
 
         try:
             importlib.import_module(modname)
-            ok.append(name)
+            ok.append(modname)
         except Exception as e:
-            # Keep booting; just don't advertise/register what failed.
             msg = f"[ops] FAILED import {modname}: {type(e).__name__}: {e}"
             if strict:
                 raise RuntimeError(msg) from e
@@ -137,6 +140,7 @@ def load_modules(
     return ok
 
 
-# Optional: allow autoload when explicitly requested. If not rub magic rock three times. 
-if os.getenv("OPS_AUTOLOAD", "").strip() in ("1", "true", "yes", "on"):
+# Optional autoload if explicitly requested (off by default).
+# Because a CPU shouldn't fail to boot because someone dropped a cursed GPU op in the image.
+if os.getenv("OPS_AUTOLOAD", "").strip().lower() in ("1", "true", "yes", "on"):
     load_modules()

@@ -61,7 +61,6 @@ CAPABILITIES_LIST: List[str] = []
 # ---------------- http helpers ----------------
 
 _session = requests.Session()
-
 _last_err: Dict[str, float] = {}
 
 
@@ -110,7 +109,6 @@ def _collect_metrics() -> Dict[str, Any]:
 
 # ---------------- v1 lease / result ----------------
 
-# Cache epochs to avoid repeated GETs if the controller omits job_epoch in lease payload.
 _epoch_cache: Dict[str, int] = {}
 
 
@@ -118,7 +116,6 @@ def _get_job_epoch(job_id: str) -> Optional[int]:
     if job_id in _epoch_cache:
         return _epoch_cache[job_id]
 
-    # 1 retry (helps during controller restart / brief race)
     for _ in range(2):
         code, body = _get_json(f"/v1/jobs/{job_id}")
         if code == 200 and isinstance(body, dict):
@@ -136,7 +133,7 @@ def _get_job_epoch(job_id: str) -> Optional[int]:
 def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
-        # dict form is fine; controller normalizes list|dict
+        # controller normalizes list|dict; we send dict form for extensibility
         "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
@@ -169,7 +166,6 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     if not task:
         return None
 
-    # job_epoch MUST be present for /v1/results
     job_epoch = task.get("job_epoch") or body.get("job_epoch")
 
     if job_epoch is None:
@@ -178,7 +174,6 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
             job_epoch = _get_job_epoch(job_id)
 
     if job_epoch is None:
-        # At this point we cannot safely post a result (controller will 422).
         raise RuntimeError(f"missing job_epoch in lease response: {body}")
 
     try:
@@ -200,7 +195,7 @@ def _post_result(
     payload: Dict[str, Any] = {
         "lease_id": lease_id,
         "job_id": job_id,
-        "job_epoch": int(job_epoch),  # REQUIRED by controller
+        "job_epoch": int(job_epoch),
         "status": status,
         "result": result,
         "error": error,
@@ -242,6 +237,116 @@ def _run_task(op: str, payload: Dict[str, Any]) -> Any:
     return fn(payload)
 
 
+# ---------------- ops loader (FIXED) ----------------
+
+
+def _module_basename(modname: str) -> str:
+    # "ops.gpu_warmup" -> "gpu_warmup"
+    return modname.split(".")[-1].strip()
+
+
+def _try_register_from_module(modname: str, mod: Any) -> None:
+    """
+    Populate OPS from an ops module using multiple conventions:
+
+    1) module.OPS dict: {"op_name": callable, ...}
+    2) module.register_op: tries common signatures:
+       - register_op(OPS)
+       - register_op(OPS, op_name)
+       - register_op() -> dict
+    3) module.handle(payload) callable: op_name defaults to module basename
+    4) ops.echo.echo_op(payload): op_name "echo"
+    """
+    global OPS
+
+    # (1) OPS dict convention
+    if hasattr(mod, "OPS") and isinstance(getattr(mod, "OPS"), dict):
+        for k, v in getattr(mod, "OPS").items():
+            if isinstance(k, str) and callable(v):
+                OPS[k] = v
+        return
+
+    # (2) register_op convention
+    reg = getattr(mod, "register_op", None)
+    if callable(reg):
+        base = _module_basename(modname)
+
+        # Try register_op(OPS)
+        try:
+            out = reg(OPS)  # type: ignore[misc]
+            if isinstance(out, dict):
+                for k, v in out.items():
+                    if isinstance(k, str) and callable(v):
+                        OPS[k] = v
+                return
+        except TypeError:
+            pass
+
+        # Try register_op(OPS, op_name)
+        try:
+            out = reg(OPS, base)  # type: ignore[misc]
+            if isinstance(out, dict):
+                for k, v in out.items():
+                    if isinstance(k, str) and callable(v):
+                        OPS[k] = v
+                return
+            # If it registered in-place, accept that too.
+            if base in OPS:
+                return
+        except TypeError:
+            pass
+
+        # Try register_op() -> dict
+        try:
+            out = reg()  # type: ignore[misc]
+            if isinstance(out, dict):
+                for k, v in out.items():
+                    if isinstance(k, str) and callable(v):
+                        OPS[k] = v
+                return
+        except TypeError:
+            pass
+
+        # If register_op exists but we couldn't call it, continue to fallback
+        # instead of silently succeeding.
+
+    # (3) handle convention
+    handle = getattr(mod, "handle", None)
+    if callable(handle):
+        OPS[_module_basename(modname)] = handle
+        return
+
+    # (4) echo special-case: echo_op convention
+    if modname == "ops.echo":
+        echo_op = getattr(mod, "echo_op", None)
+        if callable(echo_op):
+            OPS["echo"] = echo_op
+            return
+
+
+def _try_import_ops() -> None:
+    global OPS, CAPABILITIES_LIST
+
+    OPS = {}
+    for modname in OPS_MODULES:
+        try:
+            print(f"[ops] importing {modname}", flush=True)
+            mod = importlib.import_module(modname)
+        except Exception:
+            # Modules may not exist on some agents (e.g., GPU ops on CPU-only)
+            continue
+
+        try:
+            _try_register_from_module(modname, mod)
+        except Exception as e:
+            _log_err_ratelimited(
+                "ops_register",
+                f"[agent-v1] op register failed for {modname}: {type(e).__name__}: {e}",
+            )
+
+    CAPABILITIES_LIST = sorted(list(OPS.keys()))
+
+
 # ---------------- main loop ----------------
 
 _stop = False
@@ -256,6 +361,9 @@ def _handle_sigterm(_signo: int, _frame: Any) -> None:
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
+
+    # Ensure OPS + capabilities are loaded before we announce/register/lease.
+    _try_import_ops()
 
     print(
         f"[agent-v1] starting v1-only controller='{CTRL}' api_prefix='{API_PREFIX}' "
@@ -272,7 +380,6 @@ def main() -> int:
 
             lease_id, job_epoch, task = leased
 
-            # IMPORTANT: if task is malformed, still close the lease with a FAILED result if we have job_id.
             try:
                 job_id, op, payload = _extract_task_fields(task)
             except Exception as e:
@@ -298,10 +405,10 @@ def main() -> int:
                     )
                 continue
 
-            # Normal execution path
             try:
                 out = _run_task(op, payload)
-                _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)
+                # Controller semantics: terminal success is "completed"
+                _post_result(lease_id, job_id, job_epoch, "completed", out, None)
             except Exception as e:
                 err = {
                     "type": type(e).__name__,
@@ -324,25 +431,5 @@ def main() -> int:
     return 0
 
 
-def _try_import_ops() -> None:
-    global OPS, CAPABILITIES_LIST
-
-    for modname in OPS_MODULES:
-        try:
-            print(f"[ops] importing {modname}", flush=True)
-            mod = importlib.import_module(modname)
-        except Exception:
-            continue
-
-        # Convention: module exports OPS = {"op_name": callable, ...}
-        if hasattr(mod, "OPS") and isinstance(mod.OPS, dict):
-            for k, v in mod.OPS.items():
-                if callable(v):
-                    OPS[k] = v
-
-    CAPABILITIES_LIST = sorted(list(OPS.keys()))
-
-
 if __name__ == "__main__":
-    _try_import_ops()
     raise SystemExit(main())

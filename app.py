@@ -203,17 +203,11 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         return None
 
     lease_id = str(body.get("lease_id") or "")
+    if not lease_id:
+        return None
 
-    # job_epoch may live at top-level OR inside the job/task
-    job_epoch = int(
-        body.get("job_epoch")
-        or (body.get("task") or {}).get("job_epoch")
-        or (body.get("job") or {}).get("job_epoch")
-        or 0
-    )
-
+    # Pick a candidate task/job container
     task = None
-
     if isinstance(body.get("task"), dict):
         task = body["task"]
     elif isinstance(body.get("job"), dict):
@@ -225,8 +219,32 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         j0 = body["jobs"][0]
         task = j0 if isinstance(j0, dict) else None
 
+    # Unwrap common wrappers: {"task": {...}}, {"job": {...}}
+    if isinstance(task, dict) and isinstance(task.get("task"), dict):
+        task = task["task"]
+    if isinstance(task, dict) and isinstance(task.get("job"), dict):
+        task = task["job"]
+
+    # job_epoch may be top-level OR inside the job/task
+    job_epoch = int(
+        body.get("job_epoch")
+        or (task or {}).get("job_epoch")
+        or 0
+    )
+
     job_id = str((task or {}).get("id") or (task or {}).get("job_id") or "")
     op = str((task or {}).get("op") or "")
+
+    # If controller returned a lease wrapper but no runnable job, treat idle (NOT a lease).
+    if job_epoch <= 0 or not job_id or not op:
+        if DEBUG_TRACE:
+            _log(f"[trace] NO_TASK lease_id={lease_id} job_epoch={job_epoch} keys={list(body.keys())}")
+        return None
+
+    if DEBUG_TRACE:
+        _log(f"[trace] LEASED lease_id={lease_id} job_id={job_id} job_epoch={job_epoch} op={op}")
+
+    return lease_id, job_epoch, task
 
     # If controller returned a lease wrapper but no runnable job,
     # treat this as idle (NOT a lease).

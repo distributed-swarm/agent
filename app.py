@@ -203,8 +203,17 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         return None
 
     lease_id = str(body.get("lease_id") or "")
-    job_epoch = int(body.get("job_epoch") or 0)
+
+    # job_epoch may live at top-level OR inside the job/task
+    job_epoch = int(
+        body.get("job_epoch")
+        or (body.get("task") or {}).get("job_epoch")
+        or (body.get("job") or {}).get("job_epoch")
+        or 0
+    )
+
     task = None
+
     if isinstance(body.get("task"), dict):
         task = body["task"]
     elif isinstance(body.get("job"), dict):

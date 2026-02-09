@@ -204,7 +204,28 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
 
     lease_id = str(body.get("lease_id") or "")
     job_epoch = int(body.get("job_epoch") or 0)
-    task = body.get("task") or body.get("job") or {}
+    task = None
+    if isinstance(body.get("task"), dict):
+        task = body["task"]
+    elif isinstance(body.get("job"), dict):
+        task = body["job"]
+    elif isinstance(body.get("tasks"), list) and body["tasks"]:
+    t0 = body["tasks"][0]
+    task = t0 if isinstance(t0, dict) else None
+    elif isinstance(body.get("jobs"), list) and body["jobs"]:
+    j0 = body["jobs"][0]
+    task = j0 if isinstance(j0, dict) else None
+
+    job_id = str((task or {}).get("id") or (task or {}).get("job_id") or "")
+    op = str((task or {}).get("op") or "")
+
+    # If controller returned a lease wrapper but no runnable job,
+    # treat this as idle (NOT a lease).
+    if not lease_id or job_epoch <= 0 or not job_id or not op:
+        if DEBUG_TRACE and lease_id:
+            _log(f"[trace] NO_TASK lease_id={lease_id} job_epoch={job_epoch}")
+        return None
+
     if DEBUG_TRACE and lease_id and isinstance(task, dict):
         _log(
             f"[trace] LEASED lease_id={lease_id} job_id={task.get('id') or task.get('job_id')} "

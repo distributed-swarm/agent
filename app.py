@@ -46,6 +46,52 @@ def _url(path: str) -> str:
     # path should start with "/"
     return f"{CTRL}{API_PREFIX}{path}"
 
+def _normalize_lease(body: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize controller lease responses into a canonical task dict.
+
+    Accepts:
+      - {"lease_id","job_epoch","job": {...}}
+      - {"lease_id","job_epoch","task": {...}}
+      - {"lease_id","job_epoch","jobs": [ {...} ]}
+      - {"lease_id","job_epoch","tasks":[ {...} ]}
+
+    Returns:
+      {"job_id","job_epoch","lease_id","op","payload"} or None
+    """
+    if not body or not isinstance(body, dict):
+        return None
+
+    lease_id = body.get("lease_id")
+    job_epoch = body.get("job_epoch")
+
+    job = None
+    if isinstance(body.get("job"), dict):
+        job = body["job"]
+    elif isinstance(body.get("task"), dict):
+        job = body["task"]
+    elif isinstance(body.get("jobs"), list) and body["jobs"]:
+        job = body["jobs"][0]
+    elif isinstance(body.get("tasks"), list) and body["tasks"]:
+        job = body["tasks"][0]
+
+    if not isinstance(job, dict):
+        return None
+
+    job_id = job.get("id") or job.get("job_id")
+    op = job.get("op")
+    payload = job.get("payload", {})
+
+    if not job_id or not op or not lease_id or job_epoch is None:
+        return None
+
+    return {
+        "job_id": job_id,
+        "job_epoch": job_epoch,
+        "lease_id": lease_id,
+        "op": op,
+        "payload": payload if isinstance(payload, dict) else {},
+    }
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
@@ -74,7 +120,6 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
         if DEBUG_TRACE:
             _log(f"[trace] POST {url} -> EXC {type(e).__name__}: {e} in {time.time()-t0:.3f}s")
         return 0, f"{type(e).__name__}: {e}"
-
 
 def _load_ops() -> None:
     """

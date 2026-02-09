@@ -20,6 +20,9 @@ LEASE_BACKOFF_SEC = float(os.getenv("LEASE_BACKOFF_SEC", "0.05"))
 ERROR_BACKOFF_SEC = float(os.getenv("ERROR_BACKOFF_SEC", "1.0"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
 
+# Toggle tracing without changing behavior
+DEBUG_TRACE = os.getenv("DEBUG_TRACE", "0") == "1"
+
 # Lease params
 MAX_TASKS = int(os.getenv("MAX_TASKS", "1"))
 LEASE_TIMEOUT_MS = int(os.getenv("LEASE_TIMEOUT_MS", "10000"))
@@ -36,29 +39,41 @@ OPS_MODULES_ENV = os.getenv("OPS_MODULES", "").strip()
 OPS: Dict[str, Any] = {}
 CAPABILITIES_LIST: List[str] = []
 
+_stop = False
+
 
 def _url(path: str) -> str:
     # path should start with "/"
     return f"{CTRL}{API_PREFIX}{path}"
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
     url = _url(path)
+    t0 = time.time()
     try:
         r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
         if r.status_code == 204:
+            if DEBUG_TRACE:
+                _log(f"[trace] POST {url} -> 204 in {time.time()-t0:.3f}s")
             return 204, None
+
         # best-effort JSON, fallback to text
         try:
-            return r.status_code, r.json()
+            body: Any = r.json()
         except Exception:
-            return r.status_code, r.text
+            body = r.text
+
+        if DEBUG_TRACE:
+            _log(f"[trace] POST {url} -> {r.status_code} in {time.time()-t0:.3f}s")
+        return r.status_code, body
     except Exception as e:
+        if DEBUG_TRACE:
+            _log(f"[trace] POST {url} -> EXC {type(e).__name__}: {e} in {time.time()-t0:.3f}s")
         return 0, f"{type(e).__name__}: {e}"
-
-
-def _log(msg: str) -> None:
-    print(msg, flush=True)
 
 
 def _load_ops() -> None:
@@ -111,6 +126,23 @@ def _heartbeat() -> None:
         _log(f"[agent-v1] heartbeat unexpected HTTP {code}: {body}")
 
 
+def _task_job_id(task: Dict[str, Any]) -> str:
+    return str(task.get("id") or task.get("job_id") or "")
+
+
+def _extract_task_fields(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    job_id = _task_job_id(task)
+    op = str(task.get("op") or "")
+    payload = task.get("payload") or {}
+    if not isinstance(payload, dict):
+        raise TypeError(f"payload must be object/dict, got {type(payload).__name__}")
+    if not job_id:
+        raise ValueError("missing job_id")
+    if not op:
+        raise ValueError("missing op")
+    return job_id, op, payload
+
+
 def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
@@ -118,81 +150,53 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
     }
-    code, body = _post_json("/v1/leases", payload)
 
+    code, body = _post_json("/v1/leases", payload)
     if code == 204:
         return None
+    if code != 200 or not isinstance(body, dict):
+        return None
 
-    if code == 200 and isinstance(body, dict):
-        lease_id = str(body.get("lease_id") or "")
-        job_epoch = int(body.get("job_epoch") or 0)
-        task = body.get("task") or body.get("job") or {}
-        if lease_id and isinstance(task, dict):
-            return lease_id, job_epoch, task
+    lease_id = str(body.get("lease_id") or "")
+    job_epoch = int(body.get("job_epoch") or 0)
+    task = body.get("task") or body.get("job") or {}
+    if DEBUG_TRACE and lease_id and isinstance(task, dict):
+        _log(
+            f"[trace] LEASED lease_id={lease_id} job_id={task.get('id') or task.get('job_id')} "
+            f"job_epoch={job_epoch} op={task.get('op')}"
+        )
 
-    if code == 0:
-        raise RuntimeError(f"lease failed: {body}")
-    raise RuntimeError(f"lease HTTP {code}: {body}")
-
-
-def _task_job_id(task: Dict[str, Any]) -> str:
-    return str(task.get("job_id") or task.get("id") or "")
-
-
-def _extract_task_fields(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-    job_id = _task_job_id(task)
-    op = str(task.get("op") or "")
-    payload = task.get("payload")
-    if payload is None:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {"payload": payload}
-
-    if not job_id:
-        raise ValueError(f"bad task: missing job_id: {task}")
-    if not op:
-        raise ValueError(f"bad task: missing op: {task}")
-    return job_id, op, payload
+    if lease_id and isinstance(task, dict):
+        return lease_id, job_epoch, task
+    return None
 
 
 def _run_task(op: str, payload: Dict[str, Any]) -> Any:
     fn = OPS.get(op)
-    if fn is None:
-        raise RuntimeError(f"unknown op: {op}")
+    if not fn:
+        raise KeyError(f"op not supported: {op}")
+    # op functions are expected to be pure-ish and return JSON-serializable output
     return fn(payload)
 
 
-def _post_result(
-    lease_id: str,
-    job_id: str,
-    job_epoch: int,
-    status: str,
-    result: Any,
-    error: Optional[Dict[str, Any]],
-) -> None:
-    # Controller contract: status must be 'succeeded' or 'failed'
-    payload: Dict[str, Any] = {
+def _post_result(lease_id: str, job_id: str, job_epoch: int, status: str, result: Any, error: Any) -> None:
+    payload = {
         "lease_id": lease_id,
         "job_id": job_id,
-        "job_epoch": int(job_epoch),
+        "job_epoch": job_epoch,
         "status": status,
         "result": result,
         "error": error,
     }
     code, body = _post_json("/v1/results", payload)
-    if code == 0:
-        raise RuntimeError(f"result failed: {body}")
-    if code >= 400:
-        raise RuntimeError(f"result HTTP {code}: {body}")
+    if code in (200, 204):
+        return
+    raise RuntimeError(f"results post failed HTTP {code}: {body}")
 
 
-_stop = False
-
-
-def _handle_sigterm(_signo: int, _frame: Any) -> None:
+def _handle_sigterm(signum: int, frame: Any) -> None:
     global _stop
     _stop = True
-    _log("[agent-v1] stop signal received, shutting down...")
 
 
 def main() -> int:
@@ -206,8 +210,6 @@ def main() -> int:
         f"agent='{AGENT_NAME}' ops={CAPABILITIES_LIST}"
     )
 
-    # Rub magic rock three times clockwise. If you rub it four times,
-    # it works *even better* at breaking things.
     last_hb = 0.0
 
     while not _stop:
@@ -226,6 +228,8 @@ def main() -> int:
 
             try:
                 job_id, op, payload = _extract_task_fields(task)
+                if DEBUG_TRACE:
+                    _log(f"[trace] START job_id={job_id} op={op} lease_id={lease_id} job_epoch={job_epoch}")
             except Exception as e:
                 job_id = _task_job_id(task)
                 err = {"type": type(e).__name__, "message": str(e), "trace": traceback.format_exc(), "task": task}
@@ -234,12 +238,27 @@ def main() -> int:
                 continue
 
             try:
+                t0 = time.time()
                 out = _run_task(op, payload)
+                if DEBUG_TRACE:
+                    _log(f"[trace] FINISH job_id={job_id} op={op} status=succeeded op_secs={time.time()-t0:.3f}")
                 _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)
+                if DEBUG_TRACE:
+                    _log(
+                        f"[trace] RESULT_SENT_ATTEMPT job_id={job_id} lease_id={lease_id} "
+                        f"job_epoch={job_epoch} status=succeeded"
+                    )
             except Exception as e:
+                if DEBUG_TRACE:
+                    _log("[trace] OP EXCEPTION:\n" + traceback.format_exc())
                 err = {"type": type(e).__name__, "message": str(e), "trace": traceback.format_exc()}
                 try:
                     _post_result(lease_id, job_id, job_epoch, "failed", None, err)
+                    if DEBUG_TRACE:
+                        _log(
+                            f"[trace] RESULT_SENT_ATTEMPT job_id={job_id} lease_id={lease_id} "
+                            f"job_epoch={job_epoch} status=failed"
+                        )
                 except Exception as post_e:
                     _log(f"[agent-v1] post result error: {post_e}")
                     _log(f"[agent-v1] original error: {e}")

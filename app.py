@@ -210,11 +210,11 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     elif isinstance(body.get("job"), dict):
         task = body["job"]
     elif isinstance(body.get("tasks"), list) and body["tasks"]:
-    t0 = body["tasks"][0]
-    task = t0 if isinstance(t0, dict) else None
+        t0 = body["tasks"][0]
+        task = t0 if isinstance(t0, dict) else None
     elif isinstance(body.get("jobs"), list) and body["jobs"]:
-    j0 = body["jobs"][0]
-    task = j0 if isinstance(j0, dict) else None
+        j0 = body["jobs"][0]
+        task = j0 if isinstance(j0, dict) else None
 
     job_id = str((task or {}).get("id") or (task or {}).get("job_id") or "")
     op = str((task or {}).get("op") or "")

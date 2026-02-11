@@ -1,4 +1,3 @@
-# agent/app.py
 from __future__ import annotations
 
 import json
@@ -14,6 +13,14 @@ import requests
 AGENT_NAME = os.getenv("AGENT_NAME", "agent-unknown").strip() or "agent-unknown"
 CTRL = os.getenv("CONTROLLER_URL", "http://localhost:8080").rstrip("/")
 API_PREFIX = os.getenv("API_PREFIX", "").strip().rstrip("/")  # usually ""
+
+# Namespace (labels.namespace) — IMPORTANT for matching & filtering
+NAMESPACE = (
+    os.getenv("NAMESPACE")
+    or os.getenv("AGENT_NAMESPACE")
+    or os.getenv("MYZEL_NAMESPACE")
+    or "default"
+).strip() or "default"
 
 # Networking / pacing
 LEASE_BACKOFF_SEC = float(os.getenv("LEASE_BACKOFF_SEC", "0.05"))
@@ -46,52 +53,6 @@ def _url(path: str) -> str:
     # path should start with "/"
     return f"{CTRL}{API_PREFIX}{path}"
 
-def _normalize_lease(body: Any) -> Optional[Dict[str, Any]]:
-    """
-    Normalize controller lease responses into a canonical task dict.
-
-    Accepts:
-      - {"lease_id","job_epoch","job": {...}}
-      - {"lease_id","job_epoch","task": {...}}
-      - {"lease_id","job_epoch","jobs": [ {...} ]}
-      - {"lease_id","job_epoch","tasks":[ {...} ]}
-
-    Returns:
-      {"job_id","job_epoch","lease_id","op","payload"} or None
-    """
-    if not body or not isinstance(body, dict):
-        return None
-
-    lease_id = body.get("lease_id")
-    job_epoch = body.get("job_epoch")
-
-    job = None
-    if isinstance(body.get("job"), dict):
-        job = body["job"]
-    elif isinstance(body.get("task"), dict):
-        job = body["task"]
-    elif isinstance(body.get("jobs"), list) and body["jobs"]:
-        job = body["jobs"][0]
-    elif isinstance(body.get("tasks"), list) and body["tasks"]:
-        job = body["tasks"][0]
-
-    if not isinstance(job, dict):
-        return None
-
-    job_id = job.get("id") or job.get("job_id")
-    op = job.get("op")
-    payload = job.get("payload", {})
-
-    if not job_id or not op or not lease_id or job_epoch is None:
-        return None
-
-    return {
-        "job_id": job_id,
-        "job_epoch": job_epoch,
-        "lease_id": lease_id,
-        "op": op,
-        "payload": payload if isinstance(payload, dict) else {},
-    }
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
@@ -120,6 +81,7 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
         if DEBUG_TRACE:
             _log(f"[trace] POST {url} -> EXC {type(e).__name__}: {e} in {time.time()-t0:.3f}s")
         return 0, f"{type(e).__name__}: {e}"
+
 
 def _load_ops() -> None:
     """
@@ -150,6 +112,11 @@ def _load_ops() -> None:
         CAPABILITIES_LIST = []
 
 
+def _labels() -> Dict[str, str]:
+    # Single source of truth for agent labels
+    return {"namespace": NAMESPACE}
+
+
 def _heartbeat() -> None:
     """
     Optional but useful: keep last_seen fresh on controller.
@@ -157,7 +124,7 @@ def _heartbeat() -> None:
     """
     payload = {
         "name": AGENT_NAME,
-        "labels": {},
+        "labels": _labels(),
         "worker_profile": {},
         "capabilities": {"ops": CAPABILITIES_LIST},
         "metrics": {},
@@ -194,6 +161,8 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
+        # NOTE: controller decides namespace via agent labels; we do NOT put namespace here unless your
+        # controller lease schema explicitly supports it.
     }
 
     code, body = _post_json("/v1/leases", payload)
@@ -226,11 +195,7 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
         task = task["job"]
 
     # job_epoch may be top-level OR inside the job/task
-    job_epoch = int(
-        body.get("job_epoch")
-        or (task or {}).get("job_epoch")
-        or 0
-    )
+    job_epoch = int(body.get("job_epoch") or (task or {}).get("job_epoch") or 0)
 
     job_id = str((task or {}).get("id") or (task or {}).get("job_id") or "")
     op = str((task or {}).get("op") or "")
@@ -246,29 +211,11 @@ def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
 
     return lease_id, job_epoch, task
 
-    # If controller returned a lease wrapper but no runnable job,
-    # treat this as idle (NOT a lease).
-    if not lease_id or job_epoch <= 0 or not job_id or not op:
-        if DEBUG_TRACE and lease_id:
-            _log(f"[trace] NO_TASK lease_id={lease_id} job_epoch={job_epoch}")
-        return None
-
-    if DEBUG_TRACE and lease_id and isinstance(task, dict):
-        _log(
-            f"[trace] LEASED lease_id={lease_id} job_id={task.get('id') or task.get('job_id')} "
-            f"job_epoch={job_epoch} op={task.get('op')}"
-        )
-
-    if lease_id and isinstance(task, dict):
-        return lease_id, job_epoch, task
-    return None
-
 
 def _run_task(op: str, payload: Dict[str, Any]) -> Any:
     fn = OPS.get(op)
     if not fn:
         raise KeyError(f"op not supported: {op}")
-    # op functions are expected to be pure-ish and return JSON-serializable output
     return fn(payload)
 
 
@@ -300,7 +247,7 @@ def main() -> int:
 
     _log(
         f"[agent-v1] starting v1-only controller='{CTRL}' api_prefix='{API_PREFIX}' "
-        f"agent='{AGENT_NAME}' ops={CAPABILITIES_LIST}"
+        f"agent='{AGENT_NAME}' namespace='{NAMESPACE}' ops={CAPABILITIES_LIST}"
     )
 
     last_hb = 0.0
@@ -336,22 +283,12 @@ def main() -> int:
                 if DEBUG_TRACE:
                     _log(f"[trace] FINISH job_id={job_id} op={op} status=succeeded op_secs={time.time()-t0:.3f}")
                 _post_result(lease_id, job_id, job_epoch, "succeeded", out, None)
-                if DEBUG_TRACE:
-                    _log(
-                        f"[trace] RESULT_SENT_ATTEMPT job_id={job_id} lease_id={lease_id} "
-                        f"job_epoch={job_epoch} status=succeeded"
-                    )
             except Exception as e:
                 if DEBUG_TRACE:
                     _log("[trace] OP EXCEPTION:\n" + traceback.format_exc())
                 err = {"type": type(e).__name__, "message": str(e), "trace": traceback.format_exc()}
                 try:
                     _post_result(lease_id, job_id, job_epoch, "failed", None, err)
-                    if DEBUG_TRACE:
-                        _log(
-                            f"[trace] RESULT_SENT_ATTEMPT job_id={job_id} lease_id={lease_id} "
-                            f"job_epoch={job_epoch} status=failed"
-                        )
                 except Exception as post_e:
                     _log(f"[agent-v1] post result error: {post_e}")
                     _log(f"[agent-v1] original error: {e}")

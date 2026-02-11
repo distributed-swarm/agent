@@ -154,15 +154,17 @@ def _extract_task_fields(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]
         raise ValueError("missing op")
     return job_id, op, payload
 
+def _resolve_namespace() -> str:
+    ns = (os.getenv("AGENT_NAMESPACE") or os.getenv("NAMESPACE") or "").strip()
+    return ns if ns else "default"
 
 def _lease_once() -> Optional[Tuple[str, int, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
+        "namespace": _resolve_namespace(),   # <-- REQUIRED by controller
         "capabilities": {"ops": CAPABILITIES_LIST},
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
-        # NOTE: controller decides namespace via agent labels; we do NOT put namespace here unless your
-        # controller lease schema explicitly supports it.
     }
 
     code, body = _post_json("/v1/leases", payload)
